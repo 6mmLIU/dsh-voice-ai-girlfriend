@@ -1,0 +1,59 @@
+{
+  "host": "127.0.0.1",
+  "port": 8770,
+  "persona": {
+    "name": "小雅",
+    "style": "温柔、安静的助眠陪伴主播，说话很轻很慢，会认真回应每一位观众"
+  },
+  "llm": {
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "api_key": "",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "temperature": 0.8,
+    "max_history": 8,
+    "timeout_sec": 30
+  },
+  "tts": {
+    "backend": "say",
+    "say": {
+      "voice": "Tingting",
+      "rate": 135
+    },
+    "bridge": {
+      "base": "http://127.0.0.1:8765",
+      "timeout_sec": 60
+    },
+    "http": {
+      "url": "http://<你的GPU服务器IP>:9880/tts",
+      "method": "POST",
+      "json": {
+        "text": "{text}",
+        "text_lang": "zh",
+        "ref_audio_path": "/path/to/whisper_ref.wav",
+        "prompt_text": "参考音频里实际说的那句话",
+        "prompt_lang": "zh",
+        "media_type": "wav",
+        "streaming_mode": false
+      },
+      "timeout_sec": 60
+    }
+  },
+  "audio": {
+    "sample_rate": 48000,
+    "speech_rms_dbfs": -24,
+    "gap_sec": 0.45,
+    "close_distance_m": 0.12,
+    "center_distance_m": 0.25
+  },
+  "idle": {
+    "after_sec": 12,
+    "whisper_chance": 0.35,
+    "lines": [
+      "[左]还在吗…[停顿][右]我在这里陪着你哦",
+      "[中]慢慢呼吸…[呼吸]对…就是这样",
+      "[绕]今天也辛苦啦…[毛毡]",
+      "[右]放松肩膀…[左]闭上眼睛也没关系"
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ASMR Stage</title>
+  <link rel="stylesheet" href="stage.css">
+</head>
+<body>
+  <div id="stage">
+    <canvas id="scene" width="1080" height="1920"></canvas>
+    <video id="baseClip" class="clip" muted loop playsinline></video>
+    <canvas id="lights" width="1080" height="1920"></canvas>
+    <div id="caption"><div class="who"></div><div class="what"></div></div>
+    <div id="hud"></div>
+  </div>
+  <div id="start">
+    <div class="card">
+      <div class="title">点击开始</div>
+      <div class="sub">浏览器需要点一下才能出声。开播前点一次，然后用直播伴侣 / OBS 采集这个窗口和它的声音。</div>
+    </div>
+  </div>
+  <script src="stage.js"></script>
+</body>
+</html>

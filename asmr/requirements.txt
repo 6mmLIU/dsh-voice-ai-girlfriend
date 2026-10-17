@@ -1,0 +1,8 @@
+# ASMR stage runtime deps (no torch: TTS runs as a separate service).
+#   python3 -m venv venv-asmr && venv-asmr/bin/pip install -r asmr/requirements.txt
+fastapi
+uvicorn[standard]
+numpy
+scipy
+soundfile
+httpx

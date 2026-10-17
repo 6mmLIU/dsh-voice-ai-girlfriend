@@ -45,3 +45,11 @@ tts_out.wav
 Thumbs.db
 bridge/docker-compose-5060ti.yml.bak-cpu
 
+
+# ---- ASMR stage ----
+asmr/asmr-config.json
+asmr/out/
+asmr/sounds/**/*.wav
+asmr/media/**/*.mp4
+asmr/media/**/*.webm
+asmr/media/**/*.mov
