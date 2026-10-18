@@ -9,9 +9,11 @@
 <body>
   <div id="stage">
     <canvas id="scene" width="1080" height="1920"></canvas>
-    <video id="baseClip" class="clip" muted loop playsinline></video>
+    <video id="baseClip" class="clip idle" muted playsinline preload="auto"></video>
+    <video id="baseClip2" class="clip idle" muted playsinline preload="auto"></video>
     <img id="baseImg" class="clip still" alt="">
     <canvas id="lights" width="1080" height="1920"></canvas>
+    <div id="guideText"></div>
     <div id="caption"><div class="who"></div><div class="what"></div></div>
     <div id="hud"></div>
   </div>

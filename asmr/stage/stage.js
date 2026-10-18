@@ -70,53 +70,103 @@ function readLevels () {
   level.R += (r - level.R) * (r > level.R ? 0.35 : 0.06)
 }
 
-// ── Playback queue + cue timeline ─────────────────────────────────────────
-const queue = []
-let playing = null // { item, start (stage clock), fired:Set }
-const actions = [] // { name, side, start, dur, az0, az1 }
+// ── Unit playback (gapless) ───────────────────────────────────────────────
+// The server streams short units (a take, a whispered line, a transition).
+// Each is scheduled to start exactly when the previous one ends, so audio
+// and picture run on without gaps; units not started yet can be recalled
+// ("flush") when the operator stops or switches an action.
+const units = [] // { u, start (stage clock), src, fired:Set, announced }
+let tailEnd = 0 // stage time when the last scheduled unit ends
+const actions = [] // { name, side, start, dur } for lights / placeholder drawing
+const flushed = new Set()
+let chain = Promise.resolve()
+let ws = null
 
-async function playNext () {
-  if (playing || queue.length === 0 || !ac) return
-  const item = queue.shift()
-  try {
-    const resp = await fetch(item.url)
-    const audio = await ac.decodeAudioData(await resp.arrayBuffer())
-    const src = ac.createBufferSource()
-    src.buffer = audio
+function send (msg) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg))
+}
+
+function onUnit (u) {
+  chain = chain.then(() => scheduleUnit(u)).catch((err) => console.error('[asmr] unit failed', err))
+}
+
+async function scheduleUnit (u) {
+  if (!ac || flushed.has(u.id)) return
+  let buffer = null
+  if (u.url) buffer = await ac.decodeAudioData(await (await fetch(u.url)).arrayBuffer())
+  if (flushed.has(u.id)) return
+  const t = now()
+  // Back to back with the previous unit; or, coming out of idle, when the
+  // idle take reaches its first frame (see planIdleStart).
+  const start = tailEnd > t + 0.03 ? tailEnd : t + planIdleStart(u)
+  let src = null
+  if (buffer) {
+    src = ac.createBufferSource()
+    src.buffer = buffer
     src.connect(ac.destination)
     src.connect(ac.__splitter)
-    // Start when the idle loop will be exactly on its first frame at the
-    // item's first clip, so the cut from idle into the action is invisible.
-    const delay = planIdleStart(item)
-    playing = { item, start: now() + delay, fired: new Set() }
-    src.start(ac.currentTime + delay)
-    src.onended = () => {
-      playing = null
-      hideCaption()
-      playNext()
+    src.start(ac.currentTime + Math.max(0, start - now()))
+  }
+  tailEnd = start + u.duration
+  preloadClips(u)
+  units.push({ u, start, src, fired: new Set(), announced: false })
+}
+
+function flushUnits (ids) {
+  ids.forEach((id) => flushed.add(id))
+  const t = now()
+  for (let i = units.length - 1; i >= 0; i--) {
+    const x = units[i]
+    if (!ids.includes(x.u.id) || x.start <= t) continue
+    try { if (x.src) x.src.stop() } catch {}
+    dropPreloaded(x.u)
+    units.splice(i, 1)
+  }
+  tailEnd = units.reduce((m, x) => Math.max(m, x.start + x.u.duration), 0)
+}
+
+let captionUntil = 0
+function fireCues () {
+  const t = now()
+  for (const x of units) {
+    if (t < x.start) continue
+    if (!x.announced) {
+      x.announced = true
+      send({ type: 'started', id: x.u.id })
     }
-    showCaption(item)
-  } catch (err) {
-    console.error('[asmr] play failed', err)
-    playing = null
-    playNext()
+    x.u.cues.forEach((cue, i) => {
+      if (x.fired.has(i) || x.start + cue.t > t) return
+      x.fired.add(i)
+      if (cue.kind === 'clip') {
+        playClipCue(cue, `${x.u.id}:${i}`)
+      } else if (cue.kind === 'speech') {
+        actions.push({ name: 'whisper', side: cue.pos, start: x.start + cue.t, dur: cue.dur })
+        showCaption(x.u.user, cue.text)
+        captionUntil = x.start + cue.t + cue.dur
+      } else {
+        actions.push({ name: cue.name, side: cue.side, start: x.start + cue.t, dur: cue.dur })
+      }
+    })
+  }
+  for (let i = units.length - 1; i >= 0; i--) {
+    if (t > units[i].start + units[i].u.duration + 1) units.splice(i, 1)
+  }
+  if (captionUntil && t > captionUntil + 0.6) {
+    hideCaption()
+    captionUntil = 0
   }
 }
 
-function fireCues () {
-  if (!playing) return
-  const t = now() - playing.start
-  playing.item.cues.forEach((cue, i) => {
-    if (playing.fired.has(i) || cue.t > t) return
-    playing.fired.add(i)
-    if (cue.kind === 'clip') {
-      playClipCue(cue, `${playing.item.id}:${i}`)
-    } else if (cue.kind === 'speech') {
-      actions.push({ name: 'whisper', side: cue.pos, start: playing.start + cue.t, dur: cue.dur })
-    } else {
-      actions.push({ name: cue.name, side: cue.side, start: playing.start + cue.t, dur: cue.dur, az0: cue.az0, az1: cue.az1 })
-    }
-  })
+function nextClipIn () {
+  // Seconds until the next clip that has not started yet (Infinity if none).
+  const t = now()
+  let best = Infinity
+  for (const x of units) {
+    x.u.cues.forEach((c, i) => {
+      if (c.kind === 'clip' && !x.fired.has(i)) best = Math.min(best, x.start + c.t - t)
+    })
+  }
+  return best
 }
 
 function activeActions (t) {
@@ -127,51 +177,21 @@ function activeActions (t) {
 }
 
 // ── Caption ──────────────────────────────────────────────────────────────
-let captionTimer = 0
-function showCaption (item) {
-  clearTimeout(captionTimer)
-  if (!SHOW_CAPTION || !item.display) {
-    caption.classList.remove('on')
-    return
-  }
-  caption.querySelector('.who').textContent = item.user ? `回复 @${item.user}` : ''
-  caption.querySelector('.what').textContent = item.display
+function showCaption (user, text) {
+  if (!SHOW_CAPTION || !text) return
+  caption.querySelector('.who').textContent = user ? `回复 @${user}` : ''
+  caption.querySelector('.what').textContent = text
   caption.classList.add('on')
 }
 function hideCaption () {
-  clearTimeout(captionTimer)
-  captionTimer = setTimeout(() => caption.classList.remove('on'), 800)
+  caption.classList.remove('on')
 }
 
-// ── Footage: today's outfit (idle video or still) + action clips ──────────
+// ── Footage: today's outfit ───────────────────────────────────────────────
 let clips = {}
 let idleKey = ''
 const baseImg = document.getElementById('baseImg')
-
-function setIdle (videos, stills) {
-  const pick = (list) => list[Math.floor(Math.random() * list.length)]
-  // A prebuilt *_loop take (forward + backward takes joined) loops on one
-  // element with no source switch, so the idle never blinks.
-  const loops = videos.filter((u) => u.includes('_loop.'))
-  if (loops.length) videos = loops
-  if (videos.length) {
-    baseImg.classList.remove('on')
-    baseClip.src = pick(videos)
-    baseClip.onended = () => { baseClip.src = pick(videos); baseClip.play().catch(() => {}) }
-    baseClip.loop = videos.length === 1
-    baseClip.play().catch(() => {})
-    baseClip.classList.add('on')
-  } else if (stills.length) {
-    // No idle video yet: a still that slowly "breathes" stands in for it.
-    baseClip.classList.remove('on')
-    baseClip.pause()
-    baseImg.src = pick(stills)
-    baseImg.classList.add('on')
-  } else {
-    baseClip.classList.remove('on')
-    baseImg.classList.remove('on')
-  }
-}
+const baseClip2 = document.getElementById('baseClip2')
 
 async function loadClips () {
   let data = {}
@@ -179,16 +199,17 @@ async function loadClips () {
     data = await (await fetch('/api/media')).json()
   } catch { return }
   clips = data.clips || {}
-  const videos = clips.idle || []
+  // Idle playlist: every calm base-pose take (idle, breathing), never a fixed loop.
+  const videos = [...(clips.idle || []), ...(clips.breath || [])].filter((u) => !u.includes('_loop.'))
   const stills = data.stills || []
-  // Re-pick the idle only when the outfit or its files change.
   const key = JSON.stringify([data.outfit, videos, stills])
   if (key !== idleKey) {
     idleKey = key
     setIdle(videos, stills)
   }
 }
-const clipPool = new Map() // url -> preloaded <video>
+
+const clipPool = new Map() // `${unit}:${cue}` -> preloaded <video>
 let activeClips = [] // { video, until }
 
 function makeVideo (url) {
@@ -202,13 +223,10 @@ function makeVideo (url) {
   return v
 }
 
-function preloadClips (item) {
-  // One preloaded <video> per clip cue (a long action chains several takes,
-  // often of the same file), keyed by item and cue index.
-  item.cues.forEach((cue, i) => {
-    if (cue.kind === 'clip') clipPool.set(`${item.id}:${i}`, makeVideo(cue.url))
+function preloadClips (u) {
+  u.cues.forEach((cue, i) => {
+    if (cue.kind === 'clip') clipPool.set(`${u.id}:${i}`, makeVideo(cue.url))
   })
-  // Items dropped from the queue never play their clips; don't pile them up.
   while (clipPool.size > 24) {
     const [key, v] = clipPool.entries().next().value
     clipPool.delete(key)
@@ -216,22 +234,30 @@ function preloadClips (item) {
   }
 }
 
+function dropPreloaded (u) {
+  u.cues.forEach((_, i) => {
+    const key = `${u.id}:${i}`
+    const v = clipPool.get(key)
+    if (v) { v.remove(); clipPool.delete(key) }
+  })
+}
+
 function retireClip (c) {
   c.video.classList.remove('on')
   setTimeout(() => { c.video.pause(); c.video.remove() }, 600)
 }
 
-const FADE_MS = 250 // matches .clip transition; boundary frames match, the fade hides tiny drift
+const FADE_MS = 250 // matches .clip transition
 
 function playClipCue (cue, key) {
   const v = clipPool.get(key) || makeVideo(cue.url)
   clipPool.delete(key)
-  v.loop = Boolean(cue.loop)
+  v.loop = false
   v.currentTime = 0
   v.playbackRate = v.defaultPlaybackRate = cue.rate || 1
   v.play().catch(() => {})
   v.classList.add('on')
-  // The new take covers the previous one (or the idle loop); tidy up under it.
+  // The new take covers the previous one (or the idle); tidy up under it.
   const previous = activeClips
   activeClips = [{ video: v, until: now() + cue.dur }]
   setTimeout(() => { previous.forEach(retireClip); parkIdle() }, FADE_MS + 50)
@@ -247,59 +273,96 @@ function updateClip () {
   }
 }
 
-// ── Idle continuity ───────────────────────────────────────────────────────
-// Every clip starts and ends on the idle loop's first frame. So: while a clip
-// covers the idle, park the idle on frame 0; when the clip ends, the idle
-// carries on from frame 0; and before the next clip, nudge the idle's speed
-// so it is back on frame 0 exactly when that clip starts.
-const idleVideo = () => (baseClip.classList.contains('on') && baseClip.duration > 0 ? baseClip : null)
-// A *_loop idle is a forward take plus the same take reversed, so it passes
-// the first frame twice per loop: at the start and halfway through.
-const idlePeriod = (v) => v.duration / (v.currentSrc.includes('_loop.') ? 2 : 1)
+// ── Idle playlist ─────────────────────────────────────────────────────────
+// Two idle players take turns: while one plays a calm take, the other has the
+// next random take loaded; at the take's end (always the first frame, pixel
+// identical after stabilize_clips) the other one starts instantly. Each take
+// plays at a slightly different speed, so the idle never reads as a loop.
+// Before an action clip, the idle is steered so a take ends exactly when the
+// clip starts; while clips play, the idle waits on its first frame.
+const idleEls = [baseClip, baseClip2]
+let idleIdx = 0
+let idlePool = []
+const randRate = () => 0.9 + Math.random() * 0.2
+const idleVideo = () => {
+  const v = idleEls[idleIdx]
+  return v.classList.contains('on') && v.duration > 0 ? v : null
+}
+const pickIdle = (except) => {
+  const options = idlePool.filter((u) => !except || !except.endsWith(u)) 
+  const list = options.length ? options : idlePool
+  return list[Math.floor(Math.random() * list.length)]
+}
+
+function setIdle (videos, stills) {
+  idlePool = videos
+  if (videos.length) {
+    baseImg.classList.remove('on')
+    const cur = idleEls[idleIdx]
+    const other = idleEls[1 - idleIdx]
+    cur.src = pickIdle()
+    cur.playbackRate = cur.defaultPlaybackRate = randRate()
+    cur.play().catch(() => {})
+    cur.classList.add('on')
+    other.classList.remove('on')
+    other.src = pickIdle(cur.src)
+    other.load()
+  } else {
+    idleEls.forEach((v) => { v.classList.remove('on'); v.pause() })
+    if (stills.length) {
+      baseImg.src = stills[Math.floor(Math.random() * stills.length)]
+      baseImg.classList.add('on')
+    } else {
+      baseImg.classList.remove('on')
+    }
+  }
+}
+
+function onIdleEnded (ev) {
+  const cur = idleEls[idleIdx]
+  if (ev.target !== cur || !cur.classList.contains('on')) return
+  const next = idleEls[1 - idleIdx]
+  const gap = nextClipIn()
+  if (activeClips.length || gap < (next.duration || 5) / 1.25) {
+    return // a clip is about to cover the idle: hold this (first-)frame until it does
+  }
+  next.currentTime = 0
+  const fill = next.duration / gap
+  next.playbackRate = next.defaultPlaybackRate = Number.isFinite(gap) && fill >= 0.8 && fill <= 1.25 ? fill : randRate()
+  next.play().catch(() => {})
+  next.classList.add('on')
+  cur.classList.remove('on')
+  cur.pause()
+  idleIdx = 1 - idleIdx
+  cur.src = pickIdle(next.currentSrc)
+  cur.load()
+}
+idleEls.forEach((v) => v.addEventListener('ended', onIdleEnded))
 
 function parkIdle () {
   const v = idleVideo()
   if (!v || !activeClips.length) return
   v.pause()
   v.currentTime = 0
-  v.playbackRate = 1
 }
 
-function bestRate (distance, time) {
-  // Speed that covers `distance` seconds of video in `time` seconds, as close to 1 as possible.
-  let best = null
+function planIdleStart (u) {
+  // Delay before a unit that starts out of idle, so the idle take is exactly
+  // on its first frame when the unit's first clip begins.
   const v = idleVideo()
-  for (let k = 0; k < 6; k++) {
-    const r = (distance + k * (v ? idlePeriod(v) : 0)) / time
-    if (r >= 0.8 && r <= 1.25 && (!best || Math.abs(r - 1) < Math.abs(best - 1))) best = r
-  }
-  return best
-}
-
-function planIdleStart (item) {
-  const v = idleVideo()
-  const first = item.cues.find((c) => c.kind === 'clip')
+  const first = u.cues.find((c) => c.kind === 'clip')
   if (!v || !first) return 0.05
-  // Flush a clip that just ended first, so nothing resets the idle after planning.
   updateClip()
-  const P = idlePeriod(v)
-  const c = v.currentTime % P
-  if ((c < 0.25 || P - c < 0.1) && first.t < 1.5) {
-    // Right on the first frame already: hold it until the clip starts.
-    v.pause()
-    v.currentTime = Math.round(v.currentTime / P) * P % v.duration
-    return 0.05
-  }
+  if (v.paused) return Math.max(0.05, 0.05 - first.t) // already holding the first frame
+  const rem = v.duration - v.currentTime
   let best = null
-  for (let k = 0; k < 4; k++) {
-    for (const r of [1, 0.92, 1.08, 0.85, 1.15, 1.25]) {
-      const delay = (P - c + k * P) / r - first.t
-      if (delay < 0.05 || delay > 6) continue
-      const score = delay + Math.abs(r - 1) * 4
-      if (!best || score < best.score) best = { delay, r, score }
-    }
+  for (const r of [1, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.25]) {
+    const delay = rem / r - first.t
+    if (delay < 0.05 || delay > 6) continue
+    const score = delay * 0.3 + Math.abs(r - 1) * 4
+    if (!best || score < best.score) best = { delay, r, score }
   }
-  if (!best) return 0.05
+  if (!best) return 0.05 // the take ends first; onIdleEnded then holds its first frame
   v.playbackRate = best.r
   return best.delay
 }
@@ -308,21 +371,16 @@ function resumeIdle () {
   const v = idleVideo()
   if (!v) return
   v.currentTime = 0
-  let next = Infinity
-  if (playing) {
-    const t = now() - playing.start
-    const c = playing.item.cues.find((q, i) => q.kind === 'clip' && !playing.fired.has(i) && q.t > t)
-    if (c) next = c.t - t
-  }
-  if (next < 1.6) {
-    v.pause() // a short breath between two takes: hold the first frame
+  const gap = nextClipIn()
+  if (gap < 1.6) {
+    v.pause() // a short breath between two units: hold the first frame
     return
   }
-  const r = Number.isFinite(next) ? bestRate(0, next) : 1
-  v.playbackRate = r || 1
+  const fill = v.duration / gap
+  v.playbackRate = v.defaultPlaybackRate = Number.isFinite(gap) && fill >= 0.8 && fill <= 1.25 ? fill : randRate()
   v.play().catch(() => {})
 }
-const hasFootage = () => activeClips.length > 0 || baseClip.classList.contains('on') || baseImg.classList.contains('on')
+const hasFootage = () => activeClips.length > 0 || idleEls.some((v) => v.classList.contains('on')) || baseImg.classList.contains('on')
 const clipCovering = hasFootage
 
 // ── Drawing: background, felt, hands ──────────────────────────────────────
@@ -566,79 +624,97 @@ function drawScene (t, active) {
   g.drawImage(grain, Math.random() * -60, Math.random() * -60, W + 120, H + 120)
 }
 
-// ── Lights ───────────────────────────────────────────────────────────────
-// Soft violet / lavender, never warm yellow (what sleep streams use).
-const PALETTES = {
-  violet: { L: [168, 120, 255], R: [205, 150, 255], C: [190, 170, 255] },
-  lavender: { L: [190, 175, 255], R: [215, 190, 255], C: [225, 215, 255] },
-  blue: { L: [120, 150, 255], R: [150, 130, 255], C: [170, 190, 255] },
-}
-const PALETTE = PALETTES[params.get('palette')] || PALETTES.violet
-const LIGHT_L = { x: 150, y: 640, color: PALETTE.L }
-const LIGHT_R = { x: 930, y: 640, color: PALETTE.R }
-const LIGHT_C = { x: 540, y: 980, color: PALETTE.C }
-const GUIDE_IN = 4 // seconds breathing in (light rises)
-const GUIDE_OUT = 6 // seconds breathing out (light fades)
+// ── Lighting ─────────────────────────────────────────────────────────────
+// Lighting works on the footage itself instead of painting coloured blobs:
+//  * #lights is a soft-light layer: neutral grey changes nothing; a wide,
+//    soft wash from the left or right edge lifts that side of the picture,
+//    like a lamp on that side being turned up;
+//  * exposure (CSS brightness on the video layers) carries the guided
+//    breathing: the whole room slowly brightens on the inhale and dims on
+//    the exhale while the vignette closes in.
+// Everything stays within a few percent unless a light cue is running.
+const TINTS = { violet: [228, 212, 255], lavender: [236, 228, 255], blue: [214, 226, 255], warm: [255, 232, 210] }
+const TINT = TINTS[params.get('palette')] || TINTS.violet
+const GUIDE_IN = 4 // seconds breathing in (room brightens)
+const GUIDE_OUT = 6 // seconds breathing out (room dims)
+const guideText = document.getElementById('guideText')
+let exposure = 1
 
-function drawLight (g, light, intensity) {
-  const [r, gg, b] = light.color
-  const grad = g.createRadialGradient(light.x, light.y, 0, light.x, light.y, 820)
-  grad.addColorStop(0, `rgba(${r},${gg},${b},${0.55 * intensity})`)
-  grad.addColorStop(0.35, `rgba(${r},${gg},${b},${0.22 * intensity})`)
-  grad.addColorStop(1, `rgba(${r},${gg},${b},0)`)
+function setExposure (v) {
+  if (Math.abs(v - exposure) < 0.002) return
+  exposure = v
+  stageEl.style.setProperty('--exposure', v.toFixed(3))
+}
+
+function sideWash (g, side, strength) {
+  // side: -1 = left, 1 = right. A wide linear wash, no hard shape.
+  if (strength <= 0.003) return
+  const [r, gg, b] = TINT
+  const x0 = side < 0 ? 0 : W
+  const grad = g.createLinearGradient(x0, 0, W / 2 - side * W * 0.15, 0)
+  grad.addColorStop(0, `rgba(${r},${gg},${b},${clamp(strength, 0, 0.6)})`)
+  grad.addColorStop(1, 'rgba(128,128,128,0)')
+  g.fillStyle = grad
+  g.fillRect(0, 0, W, H)
+}
+
+function vignette (g, strength) {
+  if (strength <= 0.003) return
+  const grad = g.createRadialGradient(W / 2, H * 0.55, H * 0.28, W / 2, H * 0.55, H * 0.78)
+  grad.addColorStop(0, 'rgba(128,128,128,0)')
+  grad.addColorStop(1, `rgba(20,14,36,${clamp(strength, 0, 0.7)})`)
   g.fillStyle = grad
   g.fillRect(0, 0, W, H)
 }
 
 function drawLights (t, active) {
   const g = lightsCtx
-  g.clearRect(0, 0, W, H)
-  const breath = 0.5 + 0.5 * Math.sin(t * 0.55)
-  let l = 0.16 + breath * 0.06 + level.L * 0.85
-  let r = 0.16 + (1 - breath) * 0.06 + level.R * 0.85
+  g.globalCompositeOperation = 'source-over'
+  g.fillStyle = 'rgb(128,128,128)' // neutral for soft-light
+  g.fillRect(0, 0, W, H)
+  if (!SHOW_LIGHTS) {
+    setExposure(1)
+    guideText.classList.remove('on')
+    return
+  }
+  // The side where the sound is gets a touch brighter.
+  let wl = level.L * 0.1
+  let wr = level.R * 0.1
+  let exp = 1
+  let vig = 0.12
   const alt = active.find((a) => a.name === 'lights')
   if (alt) {
-    // Slow left/right alternation, eased in and out over the cue.
+    // Slow left / right alternation (one side every 4 s), eased in and out.
     const k = clamp((t - alt.start) / alt.dur, 0, 1)
     const env = Math.min(1, k * 5, (1 - k) * 5)
-    const swing = 0.5 + 0.5 * Math.sin((t - alt.start) * Math.PI * 2 * 0.8)
-    l += env * swing * 0.75
-    r += env * (1 - swing) * 0.75
+    const swing = 0.5 + 0.5 * Math.sin((t - alt.start) * Math.PI * 2 / 8)
+    wl += env * swing * 0.65
+    wr += env * (1 - swing) * 0.65
   }
-  if (active.some((a) => a.name === 'breath')) {
-    const k = Math.sin(t * 2.4) * 0.5 + 0.5
-    l += 0.12 * k
-    r += 0.12 * k
-  }
-  // Guided breathing: one soft light rises for 4 s (breathe in) and fades
-  // for 6 s (breathe out); the side lights dim so the eye settles on it.
-  let c = 0
-  let phase = ''
+  if (active.some((a) => a.name === 'breath')) exp += 0.03 * (Math.sin(t * 1.6) * 0.5 + 0.5)
   const guide = active.find((a) => a.name === 'guide')
+  let phase = ''
   if (guide) {
     const local = t - guide.start
     const k = clamp(local / guide.dur, 0, 1)
-    const env = Math.min(1, k * 8, (1 - k) * 8)
+    const env = Math.min(1, k * 6, (1 - k) * 6)
     const cyc = local % (GUIDE_IN + GUIDE_OUT)
     const rise = cyc < GUIDE_IN ? ease(cyc / GUIDE_IN) : 1 - ease((cyc - GUIDE_IN) / GUIDE_OUT)
-    phase = cyc < GUIDE_IN ? '吸气' : '呼气'
-    c = env * (0.15 + 0.85 * rise)
-    l *= 1 - 0.6 * env
-    r *= 1 - 0.6 * env
+    phase = cyc < GUIDE_IN ? '吸气…' : '呼气…'
+    exp += env * (-0.16 + 0.26 * rise) // dims to ~0.84 on the exhale, up to ~1.1 on the inhale
+    vig += env * 0.45 * (1 - rise)
+    wl *= 1 - env
+    wr *= 1 - env
   }
-  if (!SHOW_LIGHTS) return
-  // Over real footage the overlay is a subtle coloured glow, not the show.
-  const k = hasFootage() ? 0.6 : 1
-  g.globalCompositeOperation = 'lighter'
-  drawLight(g, LIGHT_L, clamp(l * k, 0, 1.2))
-  drawLight(g, LIGHT_R, clamp(r * k, 0, 1.2))
-  if (c > 0) drawLight(g, LIGHT_C, clamp(c, 0, 1.2))
-  g.globalCompositeOperation = 'source-over'
+  sideWash(g, -1, wl)
+  sideWash(g, 1, wr)
+  vignette(g, vig)
+  setExposure(exp)
   if (phase && SHOW_CAPTION) {
-    g.font = '300 44px "PingFang SC", sans-serif'
-    g.textAlign = 'center'
-    g.fillStyle = `rgba(240,232,255,${0.25 + 0.5 * c})`
-    g.fillText(phase + '…', LIGHT_C.x, 560)
+    guideText.textContent = phase
+    guideText.classList.add('on')
+  } else {
+    guideText.classList.remove('on')
   }
 }
 
@@ -653,39 +729,32 @@ function frame () {
   drawScene(t, active)
   drawLights(t, active)
   if (DEBUG) {
-    hud.textContent = `ws ${wsState}  queue ${queue.length}\n` +
+    const cur = units.find((x) => t >= x.start && t < x.start + x.u.duration)
+    hud.textContent = `ws ${wsState}  units ${units.length}  next clip ${nextClipIn().toFixed(1)}\n` +
       `L ${level.L.toFixed(2)}  R ${level.R.toFixed(2)}\n` +
       `${active.map((a) => `${a.name}:${a.side || ''}`).join(' ') || 'idle'}\n` +
-      `${playing ? playing.item.display || playing.item.script : '-'}`
+      `${cur ? cur.u.what || '' : '-'}`
   }
   requestAnimationFrame(frame)
 }
 
 // ── Server connection ─────────────────────────────────────────────────────
 function connect () {
-  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`)
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`)
   let ping = 0
   ws.onopen = () => { wsState = 'open'; ping = setInterval(() => ws.send('ping'), 20000) }
   ws.onclose = () => { wsState = 'closed'; clearInterval(ping); setTimeout(connect, 2000) }
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data)
     if (msg.type === 'outfit') loadClips()
-    if (msg.type === 'play') {
-      // Before the click that unlocks audio, keep only the newest item so the
-      // first click doesn't replay a backlog; never fall more than 3 behind.
-      if (!ac) queue.length = 0
-      queue.push(msg)
-      while (queue.length > 3) queue.shift()
-      preloadClips(msg)
-      playNext()
-    }
+    else if (msg.type === 'unit') onUnit(msg)
+    else if (msg.type === 'flush') flushUnits(msg.ids || [])
   }
 }
 
 document.getElementById('start').addEventListener('click', () => {
   initAudio()
   document.getElementById('start').classList.add('hidden')
-  playNext()
 })
 
 loadClips()

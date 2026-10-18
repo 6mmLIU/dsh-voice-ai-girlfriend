@@ -9,10 +9,13 @@ that decides where the sound moves around the listener's head:
   sweep      a slow movement that drifts from one ear to the other and back
   center     in front of the mic, close
 
-Actions that need props on the desk belong to a prop scene (scene = "knock",
-"fluffy", "soft"...). Their clips start and end on that scene's frame, so the
-renderer plays the scene's transition clips around them: scene_<name>_in
-(she sets the props down) before, scene_<name>_out (she clears them) after.
+Actions that need props on the desk, or a tool in her hand, belong to a
+scene (scene = "knock", "fluffy", "brush_hold"...). Their clips start and end
+on that scene's frame, and the performer plays the scene's transitions around
+them only once: scene_<name>_in (she sets the props down / picks the tool up)
+when the scene starts, scene_<name>_out (she clears them / puts it down) when
+it ends - never in between takes. Scenes can nest (SCENE_PARENT): picking up
+the wrapping paper happens inside the paper scene, with the book still there.
 
 Durations can be changed three ways (most specific wins):
   1. in the script: a number after the tag, e.g. [耳朵按摩30] = 30 seconds
@@ -43,11 +46,11 @@ CATALOG: list[Action] = [
     Action("ear_massage", "耳朵按摩", "耳朵", 24, "ear", "手指揉捏硅胶耳廓、指腹轻搓耳垂"),
     Action("ear_pick", "掏耳朵", "耳朵", 24, "ear", "指尖在耳道口轻轻掏、刮"),
     Action("ear_swab", "棉签", "耳朵", 20, "ear", "棉签轻扫硅胶耳朵表面和耳道口", "swab"),
-    Action("ear_brush", "刷耳朵", "耳朵", 20, "ear", "软刷刷硅胶耳廓"),
+    Action("ear_brush", "刷耳朵", "耳朵", 20, "ear", "软刷刷硅胶耳廓", "brush_hold"),
     # ② 化妆刷、羽毛刷
-    Action("brush", "刷子", "刷子", 18, "sweep", "化妆刷轻扫麦克风"),
+    Action("brush", "刷子", "刷子", 18, "sweep", "化妆刷轻扫麦克风", "brush_hold"),
     Action("feather", "羽毛刷", "刷子", 18, "sweep", "羽毛刷在麦克风和桌面上缓慢扫动", "feather"),
-    Action("face_brush", "刷脸", "刷子", 15, "center", "刷子靠近镜头，像在轻刷观众的脸"),
+    Action("face_brush", "刷脸", "刷子", 15, "center", "刷子靠近镜头，像在轻刷观众的脸", "face_hold"),
     # ③ 木块、玻璃瓶、化妆品容器
     Action("tap", "敲击", "敲击", 14, "alternate", "指尖左右手交替轻敲麦克风和桌面"),
     Action("wood", "敲木盒", "敲击", 14, "alternate", "指尖或美甲缓慢敲击木盒，空心木声", "knock"),
@@ -60,9 +63,9 @@ CATALOG: list[Action] = [
     Action("felt", "毛毡", "柔软", 18, "sweep", "双手搓毛毡垫"),
     # ⑤ 纸张、包装袋、气泡膜
     Action("page", "翻书", "纸张", 18, "center", "缓慢翻书页", "paper"),
-    Action("paper", "揉纸", "纸张", 14, "sweep", "慢慢揉捏包装纸", "paper"),
+    Action("paper", "揉纸", "纸张", 14, "sweep", "慢慢揉捏包装纸", "paper_hold"),
     Action("bubble", "气泡膜", "纸张", 12, "alternate", "一颗一颗按压气泡膜", "paper"),
-    Action("tape", "胶带", "纸张", 10, "sweep", "慢慢撕开胶带", "paper"),
+    Action("tape", "胶带", "纸张", 10, "sweep", "慢慢撕开胶带", "tape_hold"),
     # ⑥ 手套、护手霜、手部动作
     Action("gloves", "手套", "手部", 18, "alternate", "戴着乳胶手套搓手、指尖摩擦", "gloves"),
     Action("hands", "搓手", "手部", 14, "center", "双手缓慢搓手，在镜头前轻柔移动", "lotion"),
@@ -72,6 +75,18 @@ CATALOG: list[Action] = [
 ]
 
 BY_KEY = {a.key: a for a in CATALOG}
+
+# Nested scenes: the parent must be open first ("base" = nothing on the desk).
+SCENE_PARENT = {"paper_hold": "paper", "tape_hold": "paper"}
+
+
+def scene_path(scene: str) -> list[str]:
+    """Scenes to have open for `scene`, outermost first: "tape_hold" -> ["paper", "tape_hold"]."""
+    path = []
+    while scene:
+        path.insert(0, scene)
+        scene = SCENE_PARENT.get(scene, "")
+    return path
 BY_TAG = {a.tag: a for a in CATALOG}
 
 _STATE = OUT_DIR / "actions.json"

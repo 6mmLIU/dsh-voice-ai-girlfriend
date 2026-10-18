@@ -1,8 +1,10 @@
-"""Render a tagged script into one 48 kHz stereo WAV plus a cue timeline.
+"""Render playback units: short 48 kHz stereo WAVs, each with a cue timeline.
 
-The cue timeline is what the stage page uses to animate in sync with the
-audio: which hand taps (and when), when the felt is rubbed, where the
-whisper sits, when the lights alternate.
+A unit is one indivisible piece of the show: a whispered line, one take of
+an action, a set-down / clear-away transition, a pause. The performer
+(performer.py) strings units together live, so an action can be stopped,
+switched or extended between any two units. The cue timeline tells the
+stage page which clip to show and when, in sync with the unit's audio.
 """
 from __future__ import annotations
 
@@ -18,13 +20,13 @@ import soundfile as sf
 from . import actions, media, sounds
 from .binaural import spatialize
 from .config import CONFIG, OUT_DIR
-from .director import parse_script, strip_tags
 from .tts import synthesize
 
 logger = logging.getLogger("asmr.render")
 
 SR = sounds.SR
-_KEEP_FILES = 60
+_KEEP_FILES = 240
+_DUCK_DB = -8.0  # an ongoing action under a whispered line
 _SIDE_AZ = {"L": -80.0, "R": 80.0, "C": 0.0}
 _TRIGGER_RMS_DBFS = -27.0
 _TRANSITION_RMS_DBFS = -32.0
@@ -67,16 +69,14 @@ def _place(pos: str) -> tuple[float, float, float]:
     return az, az, close if pos in ("L", "R") else center
 
 
-async def _speech(mix: _Mix, pos: str, text: str) -> None:
+async def speech_audio(text: str, pos: str) -> np.ndarray:
+    """A whispered line, placed around the head (stereo)."""
     mono, sr = await synthesize(text)
     mono = _trim_silence(sounds.resample(mono, sr))
     target = float(CONFIG.get("audio", {}).get("speech_rms_dbfs", -24))
     mono = sounds._fade(sounds.rms_normalize(mono, target))
     az0, az1, dist = _place(pos)
-    dur = mix.add(spatialize(mono, SR, az0, az1, dist))
-    mix.cues.append({"t": round(mix.cursor, 3), "dur": round(dur, 3), "kind": "speech", "text": text, "pos": pos})
-    _whisper_takes(mix, mix.cursor, dur)
-    mix.cursor += dur
+    return spatialize(mono, SR, az0, az1, dist)
 
 
 def _whisper_takes(mix: _Mix, start: float, dur: float) -> None:
@@ -202,93 +202,91 @@ def _next_take(key: str, last_url: str | None) -> media.Clip | None:
     return random.choice(fresh or pool) if pool else None
 
 
-def _action(mix: _Mix, key: str, pos: str, seconds: float) -> None:
-    """Perform one action for `seconds`: chain video takes (their own sound,
-    or library sound laid over them) or, with no footage, sound alone.
-
-    Takes never repeat back to back when there is more than one, and each
-    plays at a slightly different speed, so a long action does not read as a
-    loop. Prop actions are wrapped in their scene's set-down / clear-away clips."""
-    scene = actions.BY_KEY[key].scene if key in actions.BY_KEY else ""
-    if scene and media.files(key):
-        _transition(mix, f"scene_{scene}_in")
-    start = t = mix.cursor
-    takes, last_url = 0, None
-    while t < start + seconds - 1.0:
-        clip = _next_take(key, last_url)
-        if clip is None:
-            break
-        rate = round(random.uniform(*_RATE_RANGE), 3)
-        dur = clip.duration / rate
-        audio = _take_audio(clip, rate, _TRIGGER_RMS_DBFS)
-        if audio is not None:
-            mix.add(audio, at=t)
-        else:
-            side = pos if pos in ("L", "R") else ("L" if takes % 2 == 0 else "R")
-            _procedural(mix, key, side, t, dur)
-        mix.cues.append({"t": round(t, 3), "dur": round(dur, 3), "kind": "clip", "name": key, "url": clip.url, "rate": rate})
-        t += dur
-        takes += 1
-        last_url = clip.url
-    if takes == 0:
-        _procedural(mix, key, pos, start, seconds)
-        t = start + seconds
-    mix.cursor = t
-    if scene and takes:
-        _transition(mix, f"scene_{scene}_out")
+def _take(mix: _Mix, key: str, pos: str, side_index: int, last_url: str | None, at: float) -> tuple[float, str | None]:
+    """One take of `key` at `at` (video with its own or library sound, or
+    ~5 s of sound alone). Returns (duration, url)."""
+    clip = _next_take(key, last_url)
+    if clip is None:
+        dur = 5.0
+        _procedural(mix, key, pos if pos in ("L", "R") else ("L" if side_index % 2 == 0 else "R"), at, dur)
+        return dur, None
+    rate = round(random.uniform(*_RATE_RANGE), 3)
+    dur = clip.duration / rate
+    audio = _take_audio(clip, rate, _TRIGGER_RMS_DBFS)
+    if audio is not None:
+        mix.add(audio, at=at)
+    else:
+        _procedural(mix, key, pos if pos in ("L", "R") else ("L" if side_index % 2 == 0 else "R"), at, dur)
+    mix.cues.append({"t": round(at, 3), "dur": round(dur, 3), "kind": "clip", "name": key, "url": clip.url, "rate": rate})
+    return dur, clip.url
 
 
-async def render_script(script: str, meta: dict | None = None) -> dict:
-    """Render `script` to asmr/out/<id>.wav and return the play event payload."""
-    started = time.perf_counter()
-    gap = float(CONFIG.get("audio", {}).get("gap_sec", 0.45))
-    mix = _Mix(pieces=[], cues=[], cursor=0.15)
-    for seg in parse_script(script):
-        if seg.kind == "speech":
-            await _speech(mix, seg.pos, seg.text)
-        elif seg.kind == "pause":
-            mix.cursor += 1.0
-            continue
-        elif seg.name in ("lights", "guide"):
-            # Visual only and non-blocking: the light plays over whatever comes
-            # next. "guide" is a slow breathing light (4 s in, 6 s out) to follow.
-            dur = seg.seconds or (20.0 if seg.name == "guide" else 8.0)
-            mix.cues.append({"t": round(mix.cursor, 3), "dur": dur, "kind": "visual", "name": seg.name})
-            clip = media.pick(seg.name)
-            if clip is not None:  # a whole take, never cut mid-move
-                mix.cues.append({"t": round(mix.cursor, 3), "dur": round(clip.duration, 3), "kind": "clip",
-                                 "name": seg.name, "url": clip.url})
-            mix.cursor += 0.4
-            continue
-        else:
-            _action(mix, seg.name, seg.pos, seg.seconds or actions.seconds(seg.name))
-        mix.cursor += gap
-
-    end = max([mix.cursor] + [(s + len(p)) / SR for s, p in mix.pieces]) + 0.3
-    out = np.zeros((int(end * SR), 2), dtype=np.float32)
-    for start, piece in mix.pieces:
-        out[start:start + len(piece)] += piece[: len(out) - start]
-    peak = float(np.max(np.abs(out))) if len(out) else 0.0
-    if peak > 0.89:
-        out *= 0.89 / peak
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def _finish(mix: _Mix, duration: float, meta: dict) -> dict:
+    """Write the unit's WAV (if it has sound) and return the stage payload."""
     item_id = uuid.uuid4().hex[:12]
-    path = OUT_DIR / f"{item_id}.wav"
-    sf.write(path, out, SR, subtype="PCM_16")
-    _prune()
-    duration = len(out) / SR
-    logger.info("rendered %s: %.2fs audio in %.2fs (%s)", item_id, duration, time.perf_counter() - started, script)
-    return {
-        "type": "play",
-        "id": item_id,
-        "url": f"/out/{item_id}.wav",
-        "duration": round(duration, 3),
-        "cues": mix.cues,
-        "script": script,
-        "display": strip_tags(script),
-        **(meta or {}),
-    }
+    url = None
+    if mix.pieces:
+        out = np.zeros((int(duration * SR) + 1, 2), dtype=np.float32)
+        for start, piece in mix.pieces:
+            if start < len(out):
+                out[start:start + len(piece)] += piece[: len(out) - start]
+        peak = float(np.max(np.abs(out)))
+        if peak > 0.89:
+            out *= 0.89 / peak
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        sf.write(OUT_DIR / f"{item_id}.wav", out, SR, subtype="PCM_16")
+        url = f"/out/{item_id}.wav"
+        _prune()
+    return {"type": "unit", "id": item_id, "url": url, "duration": round(duration, 3), "cues": mix.cues, **meta}
+
+
+def unit_take(key: str, pos: str, side_index: int, last_url: str | None, meta: dict) -> tuple[dict, str | None]:
+    """One take of an ongoing action."""
+    mix = _Mix(pieces=[], cues=[])
+    dur, url = _take(mix, key, pos, side_index, last_url, 0.0)
+    return _finish(mix, dur, meta), url
+
+
+def unit_transition(name: str, meta: dict) -> dict | None:
+    """A set-down / clear-away (or pick-up / put-down) clip, or None without footage."""
+    clip = media.pick(name)
+    if clip is None:
+        return None
+    mix = _Mix(pieces=[], cues=[])
+    audio = _take_audio(clip, 1.0, _TRANSITION_RMS_DBFS)
+    if audio is not None:
+        mix.add(audio, at=0.0)
+    mix.cues.append({"t": 0.0, "dur": round(clip.duration, 3), "kind": "clip", "name": name, "url": clip.url})
+    return _finish(mix, clip.duration, meta)
+
+
+def unit_pause(seconds: float, meta: dict) -> dict:
+    return _finish(_Mix(pieces=[], cues=[]), seconds, meta)
+
+
+def unit_speech(speech: np.ndarray, text: str, pos: str, meta: dict, action: dict | None = None) -> tuple[dict, str | None]:
+    """A whispered line. During an ongoing action the line rides over whole
+    takes of that action (its sound ducked), so she keeps doing it while she
+    talks; otherwise lean-in takes cover the line."""
+    mix = _Mix(pieces=[], cues=[])
+    gap = float(CONFIG.get("audio", {}).get("gap_sec", 0.45))
+    talk = len(speech) / SR
+    mix.add(speech, at=0.05)
+    mix.cues.append({"t": 0.05, "dur": round(talk, 3), "kind": "speech", "text": text, "pos": pos})
+    last_url = None
+    if action is None:
+        dur = 0.05 + talk + gap
+        _whisper_takes(mix, 0.05, talk)
+        return _finish(mix, dur, meta), None
+    t, last_url, i = 0.0, action.get("last_url"), action.get("takes", 0)
+    under = _Mix(pieces=[], cues=mix.cues)
+    while t < 0.05 + talk + 0.3:
+        dur, last_url = _take(under, action["key"], action["pos"], i, last_url, t)
+        t += dur
+        i += 1
+    duck = 10 ** (_DUCK_DB / 20)
+    mix.pieces += [(start, piece * duck) for start, piece in under.pieces]
+    return _finish(mix, t, meta), last_url
 
 
 def _prune() -> None:

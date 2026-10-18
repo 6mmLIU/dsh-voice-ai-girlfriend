@@ -44,6 +44,11 @@
     .act span { color: var(--dim); font-size: 12px; }
     .scale { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; color: var(--dim); font-size: 13px; }
     .scale input { width: 220px; padding: 0; }
+    #nowbox { grid-column: 1 / -1; }
+    .now { display: flex; align-items: baseline; gap: 14px; margin-bottom: 10px; }
+    .nowName { font-size: 22px; font-weight: 600; }
+    .nowMeta { color: var(--dim); font-variant-numeric: tabular-nums; }
+    select { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 4px 6px; }
     #log { grid-column: 1 / -1; background: var(--log); max-height: 340px; overflow: auto; font-size: 12.5px; }
     #log div { padding: 4px 0; border-bottom: 1px dashed var(--line); word-break: break-all; }
     #log .dm { color: var(--accent); }
@@ -65,25 +70,37 @@
     <div class="hint">真实的直播间弹幕抓取接入后，也是 POST 到 /api/danmaku。</div>
   </section>
 
-  <section>
-    <h2>中控插播</h2>
-    <div class="chips" id="quick">
-      <button data-s="[左][耳朵按摩][右][耳朵按摩]">按摩耳朵</button>
-      <button data-s="[左][掏耳朵][右][掏耳朵]">掏耳朵</button>
-      <button data-s="[左][刷耳朵][右][刷耳朵]">刷耳朵</button>
-      <button data-s="[中]跟着灯光…[引导]慢慢吸气…[停顿][停顿]慢慢呼气…[停顿][停顿]">呼吸引导</button>
-      <button data-s="[中][敲击]">交替敲击</button>
-      <button data-s="[中][毛毡]">搓毛毡</button>
-      <button data-s="[绕][刷子]">刷子</button>
-      <button data-s="[中][呼吸]">呼吸</button>
-      <button data-s="[中][灯光][毛毡]">交替灯光</button>
-      <button data-s="[左]左耳…[右]右耳…[绕]绕一圈">左右耳测试</button>
+  <section id="nowbox">
+    <h2>正在做</h2>
+    <div class="now">
+      <div class="nowName" id="nowName">待机</div>
+      <div class="nowMeta" id="nowMeta">点下面动作库里的动作，马上开始 / 切换</div>
+    </div>
+    <div class="chips">
+      <button class="primary" id="stopBtn">停止</button>
+      <button data-d="-10">−10 秒</button>
+      <button data-d="10">+10 秒</button>
+      <button data-d="30">+30 秒</button>
+      <button id="foreverBtn">一直做（直到停止）</button>
     </div>
     <div class="row" style="margin-top:10px">
-      <textarea id="script">[左]晚安呀…[敲击][右]今天也辛苦啦…[停顿][绕]慢慢放松就好[毛毡]</textarea>
+      <label class="toggle"><input type="checkbox" id="forever" style="width:auto"> 新开始的动作默认一直做</label>
+      <label class="toggle">位置
+        <select id="pos">
+          <option value="C">正前方</option><option value="L">左耳</option><option value="R">右耳</option><option value="SWEEP">左右</option>
+        </select>
+      </label>
     </div>
-    <button class="primary" id="cue">插播这段脚本</button>
-    <div class="hint">标签：[左] [右] [中] [绕]　[耳朵按摩] [掏耳朵] [刷耳朵] [敲击] [毛毡] [刷子] [呼吸]　[灯光] [引导] [停顿]</div>
+    <div class="hint">停止 / 切换会在手上这一下做完后生效（几秒内），并先放下工具、收走道具再回到待机或开始新动作，画面不会跳。</div>
+  </section>
+
+  <section>
+    <h2>插播一段话</h2>
+    <div class="row">
+      <textarea id="script">[左]晚安呀…今天也辛苦啦…[右]慢慢放松就好</textarea>
+    </div>
+    <button class="primary" id="cue">插播</button>
+    <div class="hint">可以夹带标签：[左] [右] [中] [绕]　动作标签如 [耳朵按摩30]　[灯光] [引导] [停顿]。正在做动作时，她会边做边说。</div>
   </section>
 
   <section>
@@ -96,7 +113,7 @@
     <h2>动作库 · 时长（秒）</h2>
     <div class="scale">全部动作时长 ×<input type="range" id="scale" min="0.5" max="3" step="0.1"><b id="scaleVal"></b></div>
     <div id="groups"></div>
-    <div class="hint">点动作名立即插播；改右边的秒数会保存（高亮表示已单独设置，清空恢复默认）。脚本里也可以写 [耳朵按摩30] 临时指定。</div>
+    <div class="hint">点动作名 = 马上开始 / 切换到这个动作。右边的秒数是它的默认时长，改了就保存（高亮表示已单独设置，清空恢复默认）。</div>
   </section>
 
   <section id="log"></section>
@@ -123,7 +140,16 @@ function sendDanmaku (user, text) {
 $('send').onclick = () => { sendDanmaku($('user').value, $('text').value); $('text').value = '' }
 $('text').onkeydown = (e) => { if (e.key === 'Enter' && !e.isComposing) $('send').click() }
 $('cue').onclick = () => post('/api/cue', { script: $('script').value })
-$('quick').onclick = (e) => { const s = e.target.dataset.s; if (s) post('/api/cue', { script: s }) }
+$('stopBtn').onclick = () => post('/api/stop', {})
+$('foreverBtn').onclick = () => post('/api/length', { forever: true })
+document.querySelectorAll('[data-d]').forEach((b) => {
+  b.onclick = async () => {
+    const now = await (await fetch('/api/now')).json()
+    if (!now.action) return
+    const total = now.action.forever ? now.action.elapsed + 30 : now.action.elapsed + now.action.remaining
+    post('/api/length', { seconds: Math.max(3, total + Number(b.dataset.d)) })
+  }
+})
 
 const fakeUsers = ['月亮不睡', '小鹿', '加班狗', '晚风', '橘子汽水', '失眠星人', '阿哲', '团团']
 const fakeTexts = ['晚上好', '今天好累啊', '能叫一下我的名字吗', '睡不着', '声音好好听', '刚下班', '想听敲击声', '明天要考试了好紧张', '左耳好舒服', '陪我待一会儿']
@@ -154,7 +180,6 @@ async function loadOutfits () {
 }
 loadOutfits()
 
-const EAR_GROUP = '耳朵'
 async function loadActions () {
   const data = await (await fetch('/api/actions')).json()
   $('scale').value = data.scale
@@ -172,7 +197,7 @@ async function loadActions () {
       el.className = 'act' + (a.pinned ? ' pinned' : '')
       const btn = document.createElement('button')
       btn.textContent = a.tag
-      btn.onclick = () => post('/api/cue', { script: (name === EAR_GROUP ? '' : '[中]') + `[${a.tag}]` })
+      btn.onclick = () => post('/api/perform', { key: a.key, pos: $('pos').value, forever: $('forever').checked })
       const inp = document.createElement('input')
       inp.type = 'number'; inp.min = 2; inp.max = 120; inp.step = 1
       inp.value = a.seconds
@@ -194,8 +219,12 @@ loadActions()
 async function refreshStatus () {
   try {
     const s = await (await fetch('/api/status')).json()
-    $('status').textContent = `TTS: ${s.tts} · LLM: ${s.llm ? '已接入' : '未配置（用备用台词）'} · 待回复 ${s.pending_danmaku} · 已就绪 ${s.ready}` +
-      (s.playing ? ` · 播放中 ${s.remaining.toFixed(1)}s` : '')
+    $('status').textContent = `TTS: ${s.tts} · LLM: ${s.llm ? '已接入' : '未配置（用备用台词）'} · 待回复 ${s.pending_danmaku} · 排队 ${s.queued}`
+    const a = s.action
+    $('nowName').textContent = a ? a.tag : (s.scenes.length ? '收拾中…' : '待机')
+    $('nowMeta').textContent = a
+      ? `已做 ${a.elapsed.toFixed(0)} 秒 · ` + (a.forever ? '一直做，直到点停止' : `还剩 ${a.remaining.toFixed(0)} 秒`)
+      : (s.playing ? s.playing.what : '点下面动作库里的动作，马上开始 / 切换')
   } catch { $('status').textContent = '服务未连接' }
 }
 setInterval(refreshStatus, 1000)

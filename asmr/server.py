@@ -7,17 +7,23 @@
   /control          operator panel: simulated danmaku, manual cues, log
   POST /api/danmaku {user, text}   a viewer message (a real danmaku fetcher
                     posts here too)
-  POST /api/cue     {script}       play a hand-written tagged script now
-  WS   /ws          play events + log, pushed to stage and control pages
+  POST /api/cue     {script}       play a hand-written tagged script next
+  POST /api/perform {key, pos, seconds | forever}   start / switch an action now
+  POST /api/stop                   stop the current action
+  POST /api/length  {seconds | forever}             change the current action's length
+  GET  /api/now                    what is being performed right now
+  WS   /ws          units + log to the stage and control pages; the stage
+                    reports {"type":"started","id"} for every unit it starts
 
-The server owns the playback clock: one item plays at a time, the next reply
-renders while the current one plays, and when the chat is quiet an idle
-program (felt, taps, lights, the odd whisper) keeps the stream alive.
+The performer (performer.py) streams short units to the stage one at a time,
+so every action can be stopped, switched or extended live. When the chat is
+quiet an idle program keeps the stream alive.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 
@@ -29,8 +35,8 @@ from pydantic import BaseModel
 
 from . import actions, media
 from .config import CONFIG, MEDIA_DIR, OUT_DIR, STAGE_DIR
-from .director import Director, idle_script
-from .render import render_script
+from .director import Director
+from .performer import Performer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("asmr.server")
@@ -39,7 +45,7 @@ MAX_PENDING = 5  # danmaku waiting to be answered; older ones are dropped
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
-    tasks = [asyncio.create_task(producer()), asyncio.create_task(consumer())]
+    tasks = [asyncio.create_task(producer()), asyncio.create_task(performer.run())]
     backend = CONFIG.get("tts", {}).get("backend", "say")
     llm = "on" if director.has_llm else "off (fallback lines; set DEEPSEEK_API_KEY)"
     host, port = CONFIG.get("host", "127.0.0.1"), CONFIG.get("port", 8770)
@@ -69,9 +75,7 @@ async def no_stale_pages(request: Request, call_next):
 director = Director()
 clients: set[WebSocket] = set()
 danmaku: asyncio.Queue[dict] = asyncio.Queue()
-ready: asyncio.Queue[dict] = asyncio.Queue(maxsize=2)
-manual: asyncio.Queue[dict] = asyncio.Queue()
-state = {"playing": None, "until": 0.0, "rendering": False}
+state = {"rendering": False}
 
 
 async def broadcast(event: dict) -> None:
@@ -87,61 +91,23 @@ async def log(text: str) -> None:
     await broadcast({"type": "log", "text": text, "at": time.time()})
 
 
+performer = Performer(broadcast, log)
+
+
 async def producer() -> None:
-    """Answer danmaku one by one; the rendered item waits in `ready`."""
+    """Answer danmaku one by one; each reply joins the performer's queue."""
     while True:
         msg = await danmaku.get()
         state["rendering"] = True
         try:
             script = await director.reply(msg["user"], msg["text"])
             await log(f"导演 → {msg['user']}：{script}")
-            item = await render_script(script, {"user": msg["user"], "danmaku": msg["text"]})
-            await ready.put(item)
+            performer.enqueue_script(script, {"user": msg["user"], "danmaku": msg["text"]})
         except Exception as exc:  # noqa: BLE001
             logger.exception("reply failed")
             await log(f"回复失败：{type(exc).__name__}: {exc}")
         finally:
             state["rendering"] = False
-
-
-async def consumer() -> None:
-    """Play one item at a time: manual cues first, then replies, else idle."""
-    idle_after = float(CONFIG.get("idle", {}).get("after_sec", 12))
-    while True:
-        item = None
-        if not manual.empty():
-            item = manual.get_nowait()
-        elif not ready.empty():
-            item = ready.get_nowait()
-        else:
-            getter = asyncio.ensure_future(ready.get())
-            waiter = asyncio.ensure_future(manual.get())
-            done, pending = await asyncio.wait({getter, waiter}, timeout=idle_after, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-            # Both may finish together: play one, put the other back in front.
-            finished = [t.result() for t in (waiter, getter) if t in done]
-            if finished:
-                item = finished[0]
-                for extra in finished[1:]:
-                    await (manual if extra.get("source") == "manual" else ready).put(extra)
-        if item is None:
-            if state["rendering"] or danmaku.qsize() > 0:
-                continue  # a reply is on its way; don't cover it with idle
-            try:
-                item = await render_script(idle_script(), {"source": "idle"})
-            except Exception:  # noqa: BLE001
-                logger.exception("idle render failed")
-                await asyncio.sleep(2)
-                continue
-        state["playing"] = item
-        state["until"] = time.time() + item["duration"]
-        await broadcast(item)
-        await log(f"播放 {item.get('source', 'reply')} {item['duration']:.1f}s：{item['display'] or item['script']}")
-        await asyncio.sleep(item["duration"] + 0.25)
-        state["playing"] = None
 
 
 @app.get("/")
@@ -177,20 +143,55 @@ class CueIn(BaseModel):
 
 @app.post("/api/cue")
 async def post_cue(body: CueIn) -> dict:
-    item = await render_script(body.script, {"source": "manual"})
-    await manual.put(item)
+    performer.enqueue_script(body.script, {"source": "manual"}, front=True)
     await log(f"中控插播：{body.script}")
-    return {"ok": True, "id": item["id"], "duration": item["duration"]}
+    return {"ok": True}
+
+
+class PerformIn(BaseModel):
+    key: str
+    pos: str = "C"  # L / R / C / SWEEP
+    seconds: float | None = None  # None = the action's configured length
+    forever: bool = False  # keep going until stopped
+
+
+@app.post("/api/perform")
+async def post_perform(body: PerformIn) -> dict:
+    if body.key not in actions.BY_KEY:
+        return {"ok": False, "error": f"unknown action {body.key}"}
+    performer.perform(body.key, body.pos, body.seconds, body.forever)
+    await log(f"中控：开始 {actions.BY_KEY[body.key].tag}" + ("（一直做）" if body.forever else ""))
+    return {"ok": True, **performer.status()}
+
+
+@app.post("/api/stop")
+async def post_stop() -> dict:
+    performer.stop()
+    await log("中控：停止当前动作")
+    return {"ok": True, **performer.status()}
+
+
+class LengthIn(BaseModel):
+    seconds: float | None = None
+    forever: bool = False
+
+
+@app.post("/api/length")
+async def post_length(body: LengthIn) -> dict:
+    performer.set_length(None if body.forever else body.seconds)
+    return {"ok": True, **performer.status()}
+
+
+@app.get("/api/now")
+async def get_now() -> dict:
+    return performer.status()
 
 
 @app.get("/api/status")
 async def status() -> dict:
-    playing = state["playing"]
     return {
-        "playing": playing and {k: playing[k] for k in ("id", "display", "duration")},
-        "remaining": max(0.0, state["until"] - time.time()) if playing else 0.0,
-        "pending_danmaku": danmaku.qsize(),
-        "ready": ready.qsize(),
+        **performer.status(),
+        "pending_danmaku": danmaku.qsize() + (1 if state["rendering"] else 0),
         "llm": director.has_llm,
         "tts": CONFIG.get("tts", {}).get("backend", "say"),
     }
@@ -243,7 +244,11 @@ async def ws_endpoint(ws: WebSocket) -> None:
     clients.add(ws)
     try:
         while True:
-            await ws.receive_text()  # keepalive pings from the page
+            text = await ws.receive_text()
+            if text.startswith("{"):
+                msg = json.loads(text)
+                if msg.get("type") == "started":
+                    performer.on_started(msg.get("id", ""))
     except WebSocketDisconnect:
         pass
     finally:
