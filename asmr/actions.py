@@ -42,11 +42,11 @@ CATALOG: list[Action] = [
     # ① 硅胶耳朵 + 双耳麦克风
     Action("ear_massage", "耳朵按摩", "耳朵", 24, "ear", "手指揉捏硅胶耳廓、指腹轻搓耳垂"),
     Action("ear_pick", "掏耳朵", "耳朵", 24, "ear", "指尖在耳道口轻轻掏、刮"),
-    Action("ear_swab", "棉签", "耳朵", 20, "ear", "棉签轻扫硅胶耳朵表面和耳道口"),
+    Action("ear_swab", "棉签", "耳朵", 20, "ear", "棉签轻扫硅胶耳朵表面和耳道口", "swab"),
     Action("ear_brush", "刷耳朵", "耳朵", 20, "ear", "软刷刷硅胶耳廓"),
     # ② 化妆刷、羽毛刷
     Action("brush", "刷子", "刷子", 18, "sweep", "化妆刷轻扫麦克风"),
-    Action("feather", "羽毛刷", "刷子", 18, "sweep", "羽毛刷在麦克风和桌面上缓慢扫动"),
+    Action("feather", "羽毛刷", "刷子", 18, "sweep", "羽毛刷在麦克风和桌面上缓慢扫动", "feather"),
     Action("face_brush", "刷脸", "刷子", 15, "center", "刷子靠近镜头，像在轻刷观众的脸"),
     # ③ 木块、玻璃瓶、化妆品容器
     Action("tap", "敲击", "敲击", 14, "alternate", "指尖左右手交替轻敲麦克风和桌面"),
