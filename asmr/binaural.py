@@ -42,10 +42,12 @@ def spatialize(
     az_start: float,
     az_end: float | None = None,
     dist: float = 0.2,
+    az_curve: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return an (N, 2) float32 stereo array placing mono `x` around the head.
 
-    With `az_end` the source moves from `az_start` to `az_end` (eased).
+    With `az_end` the source moves from `az_start` to `az_end` (eased); with
+    `az_curve` (one azimuth per sample) it follows any path.
     """
     x = np.asarray(x, dtype=np.float64)
     n = len(x)
@@ -56,7 +58,8 @@ def spatialize(
 
     n_blocks = (n + _BLOCK - 1) // _BLOCK
     centers = np.minimum(np.arange(n_blocks) * _BLOCK + _BLOCK // 2, n - 1)
-    az_curve = az_start + (az_end - az_start) * _ease(n)
+    if az_curve is None or len(az_curve) != n:
+        az_curve = az_start + (az_end - az_start) * _ease(n)
     phi = np.radians(az_curve[centers])
 
     a, c = HEAD_RADIUS, SPEED_OF_SOUND

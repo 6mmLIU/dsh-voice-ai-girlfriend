@@ -2,15 +2,19 @@
 
 Script format (what the LLM writes, and what the operator can type by hand):
 
-    [左]晚安呀，小明…[敲击][右]今天辛苦了[停顿][毛毡]
+    [左]晚安呀，小明…[耳朵按摩][右]今天辛苦了[停顿][敲木盒20]
 
 Position tags set where the voice / sound sits around the listener's head:
     [左] left ear, close   [右] right ear, close
     [中] in front, close   [绕] sweeps from left ear to right ear
-Action tags insert a trigger sound and the matching stage animation:
-    [敲击] alternating fingertip taps   [毛毡] felt rubbing
-    [刷子] brush strokes                [呼吸] a soft breath
-    [灯光] alternating left/right light pulses (visual only)
+Action tags (see actions.py for the full catalog) play a long, sustained
+trigger with its sound and stage clip. A number after the tag sets its
+length in seconds: [耳朵按摩30]. Without one, the action's configured
+duration is used.
+Light tags (visual only, they play over what follows):
+    [灯光] alternating left/right light pulses
+    [引导] a slow breathing light to follow: brightens on the inhale, fades
+           on the exhale (pair it with "吸气…呼气…")
     [停顿] a silent pause
 """
 from __future__ import annotations
@@ -23,16 +27,18 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from . import actions
 from .config import CONFIG
 
 logger = logging.getLogger("asmr.director")
 
 POSITIONS = {"左": "L", "右": "R", "中": "C", "绕": "SWEEP"}
-SOUNDS = {"敲击": "tap", "毛毡": "felt", "刷子": "brush", "呼吸": "breath", "灯光": "lights"}
+VISUALS = {"灯光": "lights", "引导": "guide"}
 PAUSE = "停顿"
-MAX_SCRIPT_CHARS = 160
+MAX_SCRIPT_CHARS = 200
 
-_TAG_RE = re.compile(r"(\[[^\[\]]{1,4}\])")
+_TAG_RE = re.compile(r"(\[[^\[\]]{1,8}\])")
+_SECS_RE = re.compile(r"^(.*?)(\d{1,3})$")
 
 
 @dataclass
@@ -40,7 +46,8 @@ class Segment:
     kind: str  # "speech" | "sound" | "pause"
     pos: str = "C"  # L / R / C / SWEEP
     text: str = ""
-    name: str = ""  # sound name for kind == "sound"
+    name: str = ""  # action key (or "lights"/"guide") for kind == "sound"
+    seconds: float | None = None  # explicit length from the tag, e.g. [耳朵按摩30]
 
 
 def parse_script(script: str) -> list[Segment]:
@@ -56,10 +63,16 @@ def parse_script(script: str) -> list[Segment]:
             continue
         if token.startswith("[") and token.endswith("]"):
             tag = token[1:-1].strip()
+            secs = None
+            m = _SECS_RE.match(tag)
+            if m and m.group(1):
+                tag, secs = m.group(1), float(m.group(2))
             if tag in POSITIONS:
                 pos = POSITIONS[tag]
-            elif tag in SOUNDS:
-                out.append(Segment(kind="sound", pos=pos, name=SOUNDS[tag]))
+            elif tag in actions.BY_TAG:
+                out.append(Segment(kind="sound", pos=pos, name=actions.BY_TAG[tag].key, seconds=secs))
+            elif tag in VISUALS:
+                out.append(Segment(kind="sound", pos=pos, name=VISUALS[tag], seconds=secs))
             elif tag == PAUSE:
                 out.append(Segment(kind="pause", pos=pos))
             continue
@@ -74,30 +87,45 @@ def strip_tags(script: str) -> str:
     return _TAG_RE.sub("", script).strip()
 
 
+def _action_menu() -> str:
+    groups: dict[str, list[str]] = {}
+    for a in actions.CATALOG:
+        groups.setdefault(a.group, []).append(f"[{a.tag}] {a.describe}")
+    return "\n".join(f"   {g}：" + "；".join(items) for g, items in groups.items())
+
+
 def _system_prompt() -> str:
     persona = CONFIG.get("persona", {})
     name = persona.get("name", "小雅")
     style = persona.get("style", "温柔、安静的助眠陪伴主播")
     return f"""你是 ASMR 直播间的主播「{name}」，{style}。
 你在用耳语回应直播间观众的弹幕。观众戴着耳机，你的声音会出现在他们的左耳、右耳或正前方。
+你面前有一个双耳麦克风（两只硅胶假耳朵，就是观众的耳朵），桌上有各种 ASMR 道具。
 
 输出规则（必须遵守）：
 1. 只输出一行要被念出来的台词，夹带标签，不要任何解释、引号或换行。
 2. 台词全部是很轻的耳语口吻：短句，每句不超过 15 个字，多用"…"放慢节奏。整段不超过 50 个字。
 3. 开头先轻声叫出观众的昵称。
 4. 用位置标签安排声音方位：[左] 左耳 [右] 右耳 [中] 正前方 [绕] 从左耳绕到右耳。至少换一次方位。
-5. 在句子之间插入 1-2 个动作标签：[敲击] 指尖轻敲 [毛毡] 摩擦毛毡 [刷子] 刷子轻扫 [呼吸] 轻呼吸 [灯光] 左右交替的灯光 [停顿] 安静停一下。
-6. 不要使用除上面以外的任何标签。
+5. 在句子之间插入 1-2 个动作标签。动作会慢慢地持续做很久（十几到几十秒），所以一段回复里动作不要超过 2 个。
+   动作前面的位置标签决定在哪只耳朵 / 哪一侧做，例如 [左][耳朵按摩] 就是按摩左耳。
+   观众点名想听某种声音时，就做那个动作；可以在标签后写秒数指定时长，例如 [敲木盒30]。
+   可用动作：
+{_action_menu()}
+6. 灯光标签：[灯光] 左右交替的灯光；[引导] 跟着呼吸灯慢慢吸气呼气（观众说睡不着、焦虑时用，配合"吸气…呼气…"）。[停顿] 安静停一下。
+7. 不要使用除上面以外的任何标签。
 
 示例：
-[左]小明…晚上好呀[敲击][右]今天也辛苦了吧…[停顿][中]慢慢放松就好[毛毡]"""
+[左]小明…晚上好呀[耳朵按摩][右]今天也辛苦了吧…[停顿][中]想听木头的声音吗…[敲木盒]
+[中]睡不着吗…[引导]跟着灯光…慢慢吸气…[停顿]再慢慢呼气…[停顿][左][棉签]"""
 
 
 _FALLBACK = [
-    "[左]{user}…你来啦[敲击][右]欢迎欢迎…[停顿][中]慢慢放松哦[毛毡]",
-    "[右]{user}…收到你的话啦[刷子][左]我在认真听哦…[呼吸]",
-    "[绕]{user}…谢谢你陪着我[灯光][中]今晚也要好好休息[毛毡]",
-    "[左]嗯…{user}说得对[敲击][右]那我们再安静一会儿…[停顿]",
+    "[左]{user}…你来啦[耳朵按摩][右]欢迎欢迎…[停顿][中]慢慢放松哦",
+    "[右]{user}…收到你的话啦[刷耳朵][左]我在认真听哦…",
+    "[绕]{user}…谢谢你陪着我[灯光][中]今晚也要好好休息[敲木盒]",
+    "[中]{user}…我们一起放松一下[引导]慢慢吸气…[停顿]慢慢呼气…[停顿][左][棉签]",
+    "[中]{user}…给你翻翻书吧[翻书][右]慢慢的…不着急",
 ]
 
 
@@ -154,10 +182,8 @@ def idle_script() -> str:
     lines = idle.get("lines") or []
     if lines and random.random() < float(idle.get("whisper_chance", 0.35)):
         return random.choice(lines)
-    return random.choice([
-        "[中][毛毡][停顿][毛毡]",
-        "[中][敲击][停顿][敲击]",
-        "[绕][刷子][停顿][灯光]",
-        "[左][毛毡][右][毛毡]",
-        "[中][灯光][呼吸][灯光]",
-    ])
+    # One long trigger, sometimes with the lights; cycles through the catalog.
+    action = random.choice([a for a in actions.CATALOG if a.key != "breath"])
+    side = random.choice(["[左]", "[右]", "[中]"]) if action.placement == "ear" else "[中]"
+    light = random.choice(["", "", "[灯光]", "[引导]"])
+    return f"{light}{side}[{action.tag}]"

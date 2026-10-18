@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import media
+from . import actions, media
 from .config import CONFIG, MEDIA_DIR, OUT_DIR, STAGE_DIR
 from .director import Director, idle_script
 from .render import render_script
@@ -56,6 +56,15 @@ MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/out", StaticFiles(directory=OUT_DIR), name="out")
 app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 app.mount("/stage", StaticFiles(directory=STAGE_DIR), name="stage")
+
+
+@app.middleware("http")
+async def no_stale_pages(request: Request, call_next):
+    """Stage/control pages must pick up code changes on a plain reload."""
+    response = await call_next(request)
+    if request.url.path.startswith("/stage/") or request.url.path == "/control":
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 director = Director()
 clients: set[WebSocket] = set()
@@ -189,8 +198,43 @@ async def status() -> dict:
 
 @app.get("/api/media")
 async def media_list() -> dict:
-    """Real video clips per action (asmr/media/<action>/*.mp4), see asmr/media.py."""
-    return {"clips": media.listing()}
+    """Today's outfit, its video clips per action and idle stills (asmr/media.py)."""
+    return media.listing()
+
+
+@app.get("/api/actions")
+async def action_list() -> dict:
+    """The action catalog with current durations (seconds)."""
+    return actions.listing()
+
+
+class ActionIn(BaseModel):
+    key: str | None = None
+    seconds: float | None = None  # None with a key = back to the default
+    scale: float | None = None  # global multiplier for every action
+
+
+@app.post("/api/actions")
+async def action_set(body: ActionIn) -> dict:
+    actions.set_seconds(body.key, body.seconds, body.scale)
+    return actions.listing()
+
+
+@app.get("/api/outfits")
+async def outfit_list() -> dict:
+    return {"outfits": media.outfits(), "current": media.current_outfit(), "pinned": media.pinned_outfit()}
+
+
+class OutfitIn(BaseModel):
+    name: str | None = None  # None = back to the daily rotation
+
+
+@app.post("/api/outfit")
+async def outfit_set(body: OutfitIn) -> dict:
+    media.pin_outfit(body.name if body.name in media.outfits() else None)
+    await log(f"换装：{media.current_outfit()}（{'固定' if media.pinned_outfit() else '按天轮换'}）")
+    await broadcast({"type": "outfit", "outfit": media.current_outfit()})
+    return await outfit_list()
 
 
 @app.websocket("/ws")

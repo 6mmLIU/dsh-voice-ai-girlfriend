@@ -53,3 +53,7 @@ asmr/sounds/**/*.wav
 asmr/media/**/*.mp4
 asmr/media/**/*.webm
 asmr/media/**/*.mov
+asmr/media/**/*.png
+asmr/media/**/*.jpg
+asmr/media/**/*.jpeg
+asmr/media/**/*.webp

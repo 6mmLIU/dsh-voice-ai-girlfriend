@@ -36,9 +36,16 @@ html, body {
 .clip {
   object-fit: cover;
   opacity: 0;
-  transition: opacity 0.35s ease;
+  transition: opacity 0.25s ease;
 }
-#baseClip { transition-duration: 0.9s; }
+#baseClip, #baseImg { transition-duration: 0.9s; }
+
+/* A still standing in for idle video: slow breathing zoom and drift. */
+.still.on { animation: breathe 9s ease-in-out infinite; }
+@keyframes breathe {
+  0%, 100% { transform: scale(1.0) translateY(0); }
+  45% { transform: scale(1.018) translateY(-0.4%); }
+}
 .clip.on { opacity: 1; }
 
 #lights {

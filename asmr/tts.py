@@ -5,6 +5,8 @@ Backends (asmr-config.json -> tts.backend):
           runs on a Mac with no GPU.
   bridge  this repo's bridge/voice_bridge.py  POST /api/tts {text} (OmniVoice /
           Qwen3 clone running on your GPU box).
+  local   asmr/tts_server.py on this Mac: Qwen3-TTS (MLX) cloning the
+          designed whisper voice in asmr/voices/ (same wire format as http)
   http    any TTS server that takes JSON and returns a WAV body, e.g.
           GPT-SoVITS api_v2 (POST /tts). "{text}" in the JSON template is
           replaced by the line to speak.
@@ -16,6 +18,7 @@ import copy
 import hashlib
 import io
 import logging
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -93,8 +96,14 @@ async def synthesize(text: str) -> tuple[np.ndarray, int]:
         result = await asyncio.to_thread(_say, text, cfg)
     elif backend == "bridge":
         result = await _bridge(text, cfg)
-    elif backend == "http":
-        result = await _http(text, cfg)
+    elif backend in ("http", "local"):
+        try:
+            result = await _http(text, cfg)
+        except Exception as exc:  # noqa: BLE001 - keep the stream talking
+            if not shutil.which("say"):
+                raise
+            logger.warning("TTS[%s] failed (%s: %s), falling back to macOS say", backend, type(exc).__name__, exc)
+            return await asyncio.to_thread(_say, text, tts_cfg.get("say", {}))
     else:
         raise ValueError(f"unknown tts.backend: {backend!r}")
     if len(_cache) >= _CACHE_MAX:

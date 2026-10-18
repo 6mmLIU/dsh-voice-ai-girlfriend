@@ -1,15 +1,20 @@
-"""Real video clip library: asmr/media/<action>/*.mp4
+"""Real video clip library, with a daily wardrobe.
 
-Each action folder holds interchangeable takes of one visual moment, framed
-chest-down (hands + chest, face out of frame) in the real room:
+    asmr/media/outfits/<outfit>/<action>/*.mp4   one folder per outfit
+    asmr/media/<action>/*.mp4                    shared fallback for any outfit
 
-  idle/     background loop while nothing happens (breathing, tiny movements)
-  whisper/  played (looped) while she whispers, e.g. leaning towards the mic
-  tap/      fingertips tapping, hands alternating
-  felt/     rubbing the felt pad
-  brush/    brushing the mic / felt
-  breath/   a slow breath, chest rising
-  lights/   the practical lamps alternating left/right
+The outfit rotates by day (sorted folder names, one per day) unless the
+operator pins one from the control panel. Each action folder holds
+interchangeable takes of one visual moment, framed chest-down (hands +
+chest, face out of frame) in the real room:
+
+  idle/         background while nothing happens (breathing, tiny movements);
+                may also hold still images (.png/.jpg) until video exists
+  whisper/      played (looped) while she whispers, e.g. leaning to the mic
+  ear_massage/  kneading the dummy ears      ear_pick/  ear cleaning
+  ear_brush/    brushing the dummy ears      tap/       alternating taps
+  felt/         rubbing the felt pad         brush/     brushing the mic
+  breath/       a slow breath, chest rising  lights/ guide/  practical lights
 
 If a clip has its own audio track (filmed with a binaural mic), that audio is
 the trigger sound: picture and sound come from the same take, so they are in
@@ -21,6 +26,7 @@ silently, with library sounds.
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import logging
@@ -38,6 +44,9 @@ from .config import MEDIA_DIR, OUT_DIR
 logger = logging.getLogger("asmr.media")
 
 VIDEO_EXTS = (".mp4", ".webm", ".mov")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+OUTFITS_DIR = MEDIA_DIR / "outfits"
+_OUTFIT_STATE = OUT_DIR / "outfit.json"
 SR = 48000
 _AUDIO_CACHE = OUT_DIR / "clip-audio"
 
@@ -49,6 +58,7 @@ class Clip:
     url: str
     duration: float
     audio: np.ndarray | None  # (N, 2) float32 at 48 kHz, or None
+    reversed: bool = False  # a *_rev take: the forward take played backwards
 
 
 _clips: dict[Path, Clip] = {}
@@ -83,7 +93,7 @@ def _extract_audio(path: Path) -> np.ndarray | None:
     return data[:, :2]
 
 
-def _load(action: str, path: Path) -> Clip | None:
+def _load(action: str, path: Path, url: str) -> Clip | None:
     cached = _clips.get(path)
     if cached is not None and cached.path.stat().st_mtime_ns == path.stat().st_mtime_ns:
         return cached
@@ -95,36 +105,97 @@ def _load(action: str, path: Path) -> Clip | None:
         return None
     if audio is not None and float(np.max(np.abs(audio))) < 1e-4:
         audio = None  # silent track: treat as no audio
-    clip = Clip(action, path, f"/media/{action}/{path.name}", duration, audio)
+    is_rev = path.stem.endswith("_rev")
+    if is_rev and audio is None:
+        # A reversed copy carries no sound of its own: play the forward
+        # take's sound backwards so picture and sound still match.
+        forward = path.with_name(path.stem[:-4] + path.suffix)
+        fwd = _load(action, forward, url.rsplit("/", 1)[0] + "/" + forward.name) if forward.is_file() else None
+        if fwd is not None and fwd.audio is not None:
+            audio = np.ascontiguousarray(fwd.audio[::-1])
+    clip = Clip(action, path, url, duration, audio, is_rev)
     _clips[path] = clip
     logger.info("clip %s/%s: %.2fs, %s", action, path.name, duration, "own audio" if audio is not None else "no audio")
     return clip
 
 
-def files(action: str) -> list[Path]:
-    folder = MEDIA_DIR / action
-    if not folder.is_dir():
+def outfits() -> list[str]:
+    if not OUTFITS_DIR.is_dir():
         return []
-    return sorted(p for p in folder.iterdir() if p.suffix.lower() in VIDEO_EXTS)
+    return sorted(p.name for p in OUTFITS_DIR.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def pinned_outfit() -> str | None:
+    try:
+        name = json.loads(_OUTFIT_STATE.read_text(encoding="utf-8")).get("pinned")
+    except (OSError, ValueError):
+        return None
+    return name if name in outfits() else None
+
+
+def pin_outfit(name: str | None) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    _OUTFIT_STATE.write_text(json.dumps({"pinned": name}, ensure_ascii=False), encoding="utf-8")
+
+
+def current_outfit() -> str | None:
+    """Pinned outfit, else today's outfit in the rotation."""
+    names = outfits()
+    if not names:
+        return None
+    return pinned_outfit() or names[datetime.date.today().toordinal() % len(names)]
+
+
+def _action_dirs(action: str) -> list[tuple[Path, str]]:
+    """(folder, url prefix) to search for an action, outfit-specific first."""
+    dirs = []
+    outfit = current_outfit()
+    if outfit:
+        dirs.append((OUTFITS_DIR / outfit / action, f"/media/outfits/{outfit}/{action}"))
+    dirs.append((MEDIA_DIR / action, f"/media/{action}"))
+    return dirs
+
+
+def _entries(action: str, exts: tuple[str, ...]) -> list[tuple[Path, str]]:
+    for folder, prefix in _action_dirs(action):
+        if folder.is_dir():
+            found = [(p, f"{prefix}/{p.name}") for p in sorted(folder.iterdir()) if p.suffix.lower() in exts]
+            if found:
+                return found
+    return []
+
+
+def files(action: str) -> list[Path]:
+    return [p for p, _ in _entries(action, VIDEO_EXTS)]
+
+
+def takes(action: str) -> list[Clip]:
+    """Every usable take for `action` (current outfit first), reversed copies included."""
+    out = []
+    for path, url in _entries(action, VIDEO_EXTS):
+        clip = _load(action, path, url)
+        if clip is not None:
+            out.append(clip)
+    return out
 
 
 def pick(action: str) -> Clip | None:
-    """A random take for `action`, or None when the folder has no clips."""
-    candidates = files(action)
+    """A random video take for `action` (current outfit first), or None."""
+    candidates = _entries(action, VIDEO_EXTS)
     random.shuffle(candidates)
-    for path in candidates:
-        clip = _load(action, path)
+    for path, url in candidates:
+        clip = _load(action, path, url)
         if clip is not None:
             return clip
     return None
 
 
-def listing() -> dict[str, list[str]]:
-    """{action: [url, ...]} for the stage page."""
-    out: dict[str, list[str]] = {}
-    if MEDIA_DIR.is_dir():
-        for folder in sorted(p for p in MEDIA_DIR.iterdir() if p.is_dir()):
-            names = [f"/media/{folder.name}/{p.name}" for p in files(folder.name)]
-            if names:
-                out[folder.name] = names
-    return out
+ACTIONS = ("idle", "whisper", "ear_massage", "ear_pick", "ear_brush", "tap", "felt", "brush", "breath", "lights", "guide")
+
+
+def listing() -> dict:
+    """What the stage needs: today's outfit, its clips, and idle stills."""
+    clips = {a: [url for _, url in _entries(a, VIDEO_EXTS)] for a in ACTIONS}
+    clips = {a: urls for a, urls in clips.items() if urls}
+    stills = [url for _, url in _entries("idle", IMAGE_EXTS)]
+    return {"outfit": current_outfit(), "clips": clips, "stills": stills}

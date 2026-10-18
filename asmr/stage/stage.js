@@ -85,8 +85,11 @@ async function playNext () {
     src.buffer = audio
     src.connect(ac.destination)
     src.connect(ac.__splitter)
-    playing = { item, start: now() + 0.05, fired: new Set() }
-    src.start(ac.currentTime + 0.05)
+    // Start when the idle loop will be exactly on its first frame at the
+    // item's first clip, so the cut from idle into the action is invisible.
+    const delay = planIdleStart(item)
+    playing = { item, start: now() + delay, fired: new Set() }
+    src.start(ac.currentTime + delay)
     src.onended = () => {
       playing = null
       hideCaption()
@@ -107,7 +110,7 @@ function fireCues () {
     if (playing.fired.has(i) || cue.t > t) return
     playing.fired.add(i)
     if (cue.kind === 'clip') {
-      playClipCue(cue)
+      playClipCue(cue, `${playing.item.id}:${i}`)
     } else if (cue.kind === 'speech') {
       actions.push({ name: 'whisper', side: cue.pos, start: playing.start + cue.t, dur: cue.dur })
     } else {
@@ -140,19 +143,49 @@ function hideCaption () {
   captionTimer = setTimeout(() => caption.classList.remove('on'), 800)
 }
 
-// ── Optional video clips ──────────────────────────────────────────────────
+// ── Footage: today's outfit (idle video or still) + action clips ──────────
 let clips = {}
-async function loadClips () {
-  try {
-    clips = (await (await fetch('/api/media')).json()).clips || {}
-  } catch { clips = {} }
-  const idle = clips.idle
-  if (idle && idle.length && !baseClip.src) {
-    baseClip.src = idle[Math.floor(Math.random() * idle.length)]
-    baseClip.onended = () => { baseClip.src = idle[Math.floor(Math.random() * idle.length)]; baseClip.play().catch(() => {}) }
-    baseClip.loop = idle.length === 1
+let idleKey = ''
+const baseImg = document.getElementById('baseImg')
+
+function setIdle (videos, stills) {
+  const pick = (list) => list[Math.floor(Math.random() * list.length)]
+  // A prebuilt *_loop take (forward + backward takes joined) loops on one
+  // element with no source switch, so the idle never blinks.
+  const loops = videos.filter((u) => u.includes('_loop.'))
+  if (loops.length) videos = loops
+  if (videos.length) {
+    baseImg.classList.remove('on')
+    baseClip.src = pick(videos)
+    baseClip.onended = () => { baseClip.src = pick(videos); baseClip.play().catch(() => {}) }
+    baseClip.loop = videos.length === 1
     baseClip.play().catch(() => {})
     baseClip.classList.add('on')
+  } else if (stills.length) {
+    // No idle video yet: a still that slowly "breathes" stands in for it.
+    baseClip.classList.remove('on')
+    baseClip.pause()
+    baseImg.src = pick(stills)
+    baseImg.classList.add('on')
+  } else {
+    baseClip.classList.remove('on')
+    baseImg.classList.remove('on')
+  }
+}
+
+async function loadClips () {
+  let data = {}
+  try {
+    data = await (await fetch('/api/media')).json()
+  } catch { return }
+  clips = data.clips || {}
+  const videos = clips.idle || []
+  const stills = data.stills || []
+  // Re-pick the idle only when the outfit or its files change.
+  const key = JSON.stringify([data.outfit, videos, stills])
+  if (key !== idleKey) {
+    idleKey = key
+    setIdle(videos, stills)
   }
 }
 const clipPool = new Map() // url -> preloaded <video>
@@ -170,13 +203,15 @@ function makeVideo (url) {
 }
 
 function preloadClips (item) {
-  for (const cue of item.cues) {
-    if (cue.kind === 'clip' && !clipPool.has(cue.url)) clipPool.set(cue.url, makeVideo(cue.url))
-  }
+  // One preloaded <video> per clip cue (a long action chains several takes,
+  // often of the same file), keyed by item and cue index.
+  item.cues.forEach((cue, i) => {
+    if (cue.kind === 'clip') clipPool.set(`${item.id}:${i}`, makeVideo(cue.url))
+  })
   // Items dropped from the queue never play their clips; don't pile them up.
-  while (clipPool.size > 12) {
-    const [url, v] = clipPool.entries().next().value
-    clipPool.delete(url)
+  while (clipPool.size > 24) {
+    const [key, v] = clipPool.entries().next().value
+    clipPool.delete(key)
     v.remove()
   }
 }
@@ -186,17 +221,20 @@ function retireClip (c) {
   setTimeout(() => { c.video.pause(); c.video.remove() }, 600)
 }
 
-function playClipCue (cue) {
-  const v = clipPool.get(cue.url) || makeVideo(cue.url)
-  clipPool.delete(cue.url)
+const FADE_MS = 250 // matches .clip transition; boundary frames match, the fade hides tiny drift
+
+function playClipCue (cue, key) {
+  const v = clipPool.get(key) || makeVideo(cue.url)
+  clipPool.delete(key)
   v.loop = Boolean(cue.loop)
   v.currentTime = 0
+  v.playbackRate = v.defaultPlaybackRate = cue.rate || 1
   v.play().catch(() => {})
   v.classList.add('on')
-  // The new take covers the previous one; retire it after the crossfade.
+  // The new take covers the previous one (or the idle loop); tidy up under it.
   const previous = activeClips
   activeClips = [{ video: v, until: now() + cue.dur }]
-  setTimeout(() => previous.forEach(retireClip), 350)
+  setTimeout(() => { previous.forEach(retireClip); parkIdle() }, FADE_MS + 50)
 }
 
 function updateClip () {
@@ -205,9 +243,86 @@ function updateClip () {
   if (done.length) {
     activeClips = activeClips.filter((c) => t <= c.until)
     done.forEach(retireClip)
+    if (!activeClips.length) resumeIdle()
   }
 }
-const hasFootage = () => activeClips.length > 0 || baseClip.classList.contains('on')
+
+// ── Idle continuity ───────────────────────────────────────────────────────
+// Every clip starts and ends on the idle loop's first frame. So: while a clip
+// covers the idle, park the idle on frame 0; when the clip ends, the idle
+// carries on from frame 0; and before the next clip, nudge the idle's speed
+// so it is back on frame 0 exactly when that clip starts.
+const idleVideo = () => (baseClip.classList.contains('on') && baseClip.duration > 0 ? baseClip : null)
+// A *_loop idle is a forward take plus the same take reversed, so it passes
+// the first frame twice per loop: at the start and halfway through.
+const idlePeriod = (v) => v.duration / (v.currentSrc.includes('_loop.') ? 2 : 1)
+
+function parkIdle () {
+  const v = idleVideo()
+  if (!v || !activeClips.length) return
+  v.pause()
+  v.currentTime = 0
+  v.playbackRate = 1
+}
+
+function bestRate (distance, time) {
+  // Speed that covers `distance` seconds of video in `time` seconds, as close to 1 as possible.
+  let best = null
+  const v = idleVideo()
+  for (let k = 0; k < 6; k++) {
+    const r = (distance + k * (v ? idlePeriod(v) : 0)) / time
+    if (r >= 0.8 && r <= 1.25 && (!best || Math.abs(r - 1) < Math.abs(best - 1))) best = r
+  }
+  return best
+}
+
+function planIdleStart (item) {
+  const v = idleVideo()
+  const first = item.cues.find((c) => c.kind === 'clip')
+  if (!v || !first) return 0.05
+  // Flush a clip that just ended first, so nothing resets the idle after planning.
+  updateClip()
+  const P = idlePeriod(v)
+  const c = v.currentTime % P
+  if ((c < 0.25 || P - c < 0.1) && first.t < 1.5) {
+    // Right on the first frame already: hold it until the clip starts.
+    v.pause()
+    v.currentTime = Math.round(v.currentTime / P) * P % v.duration
+    return 0.05
+  }
+  let best = null
+  for (let k = 0; k < 4; k++) {
+    for (const r of [1, 0.92, 1.08, 0.85, 1.15, 1.25]) {
+      const delay = (P - c + k * P) / r - first.t
+      if (delay < 0.05 || delay > 6) continue
+      const score = delay + Math.abs(r - 1) * 4
+      if (!best || score < best.score) best = { delay, r, score }
+    }
+  }
+  if (!best) return 0.05
+  v.playbackRate = best.r
+  return best.delay
+}
+
+function resumeIdle () {
+  const v = idleVideo()
+  if (!v) return
+  v.currentTime = 0
+  let next = Infinity
+  if (playing) {
+    const t = now() - playing.start
+    const c = playing.item.cues.find((q, i) => q.kind === 'clip' && !playing.fired.has(i) && q.t > t)
+    if (c) next = c.t - t
+  }
+  if (next < 1.6) {
+    v.pause() // a short breath between two takes: hold the first frame
+    return
+  }
+  const r = Number.isFinite(next) ? bestRate(0, next) : 1
+  v.playbackRate = r || 1
+  v.play().catch(() => {})
+}
+const hasFootage = () => activeClips.length > 0 || baseClip.classList.contains('on') || baseImg.classList.contains('on')
 const clipCovering = hasFootage
 
 // ── Drawing: background, felt, hands ──────────────────────────────────────
@@ -452,8 +567,18 @@ function drawScene (t, active) {
 }
 
 // ── Lights ───────────────────────────────────────────────────────────────
-const LIGHT_L = { x: 150, y: 640, color: [255, 176, 104] }
-const LIGHT_R = { x: 930, y: 640, color: [255, 140, 176] }
+// Soft violet / lavender, never warm yellow (what sleep streams use).
+const PALETTES = {
+  violet: { L: [168, 120, 255], R: [205, 150, 255], C: [190, 170, 255] },
+  lavender: { L: [190, 175, 255], R: [215, 190, 255], C: [225, 215, 255] },
+  blue: { L: [120, 150, 255], R: [150, 130, 255], C: [170, 190, 255] },
+}
+const PALETTE = PALETTES[params.get('palette')] || PALETTES.violet
+const LIGHT_L = { x: 150, y: 640, color: PALETTE.L }
+const LIGHT_R = { x: 930, y: 640, color: PALETTE.R }
+const LIGHT_C = { x: 540, y: 980, color: PALETTE.C }
+const GUIDE_IN = 4 // seconds breathing in (light rises)
+const GUIDE_OUT = 6 // seconds breathing out (light fades)
 
 function drawLight (g, light, intensity) {
   const [r, gg, b] = light.color
@@ -485,13 +610,36 @@ function drawLights (t, active) {
     l += 0.12 * k
     r += 0.12 * k
   }
+  // Guided breathing: one soft light rises for 4 s (breathe in) and fades
+  // for 6 s (breathe out); the side lights dim so the eye settles on it.
+  let c = 0
+  let phase = ''
+  const guide = active.find((a) => a.name === 'guide')
+  if (guide) {
+    const local = t - guide.start
+    const k = clamp(local / guide.dur, 0, 1)
+    const env = Math.min(1, k * 8, (1 - k) * 8)
+    const cyc = local % (GUIDE_IN + GUIDE_OUT)
+    const rise = cyc < GUIDE_IN ? ease(cyc / GUIDE_IN) : 1 - ease((cyc - GUIDE_IN) / GUIDE_OUT)
+    phase = cyc < GUIDE_IN ? '吸气' : '呼气'
+    c = env * (0.15 + 0.85 * rise)
+    l *= 1 - 0.6 * env
+    r *= 1 - 0.6 * env
+  }
   if (!SHOW_LIGHTS) return
   // Over real footage the overlay is a subtle coloured glow, not the show.
-  const k = hasFootage() ? 0.55 : 1
+  const k = hasFootage() ? 0.6 : 1
   g.globalCompositeOperation = 'lighter'
   drawLight(g, LIGHT_L, clamp(l * k, 0, 1.2))
   drawLight(g, LIGHT_R, clamp(r * k, 0, 1.2))
+  if (c > 0) drawLight(g, LIGHT_C, clamp(c, 0, 1.2))
   g.globalCompositeOperation = 'source-over'
+  if (phase && SHOW_CAPTION) {
+    g.font = '300 44px "PingFang SC", sans-serif'
+    g.textAlign = 'center'
+    g.fillStyle = `rgba(240,232,255,${0.25 + 0.5 * c})`
+    g.fillText(phase + '…', LIGHT_C.x, 560)
+  }
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────
@@ -521,6 +669,7 @@ function connect () {
   ws.onclose = () => { wsState = 'closed'; clearInterval(ping); setTimeout(connect, 2000) }
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data)
+    if (msg.type === 'outfit') loadClips()
     if (msg.type === 'play') {
       // Before the click that unlocks audio, keep only the newest item so the
       // first click doesn't replay a backlog; never fall more than 3 behind.
