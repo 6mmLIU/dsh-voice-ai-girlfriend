@@ -36,6 +36,7 @@ from pydantic import BaseModel
 from . import actions, media
 from .config import CONFIG, MEDIA_DIR, OUT_DIR, STAGE_DIR
 from .director import Director
+from .interaction import Interaction
 from .performer import Performer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -135,6 +136,33 @@ async def post_danmaku(body: DanmakuIn) -> dict:
     await danmaku.put(msg)
     await broadcast({"type": "danmaku", **msg})
     return {"ok": True, "pending": danmaku.qsize()}
+
+
+class EventIn(BaseModel):
+    kind: str = "comment"  # comment | gift | join | follow | like
+    user: str = "观众"
+    text: str = ""
+    gift: str = ""
+    count: int = 1
+    id: str = ""
+    platform: str = ""
+
+
+interaction = Interaction()
+
+
+@app.post("/api/event")
+async def post_event(body: EventIn) -> dict:
+    """Normalized viewer events from platform adapters (asmr/interaction.py decides what to do)."""
+    busy = danmaku.qsize() > 0 or state["rendering"] or len(performer.steps) > 0
+    d = interaction.decide(body.model_dump(), busy)
+    if d.action == "reply":
+        return {**await post_danmaku(DanmakuIn(user=body.user, text=body.text)), "action": "reply"}
+    if d.action == "script":
+        performer.enqueue_script(d.script, {"source": body.kind, "user": body.user}, front=d.front)
+        await log(f"{body.platform or '直播间'} {body.kind} {body.user}：{d.script}")
+        return {"ok": True, "action": "script"}
+    return {"ok": True, "action": "drop", "reason": d.reason}
 
 
 class CueIn(BaseModel):

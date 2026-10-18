@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the ASMR stage server from the repo root's venv-asmr.
+# Start the ASMR stage server (macOS / Linux).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [ ! -x venv-asmr/bin/python ]; then

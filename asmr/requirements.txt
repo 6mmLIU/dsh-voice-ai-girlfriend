@@ -1,8 +1,11 @@
-# ASMR stage runtime deps (no torch: TTS runs as a separate service).
-#   python3 -m venv venv-asmr && venv-asmr/bin/pip install -r asmr/requirements.txt
+# ASMR stage runtime deps (Windows / Linux / macOS). TTS runs as a separate service
+# (see requirements-tts-mlx.txt / requirements-tts-torch.txt).
+#   python -m venv venv-asmr  &&  <venv python> -m pip install -r asmr/requirements.txt
 fastapi
 uvicorn[standard]
 numpy
 scipy
 soundfile
 httpx
+opencv-python-headless  # tools/stabilize_clips.py
+playwright              # danmaku/wechat_channels.py; then: python -m playwright install chromium

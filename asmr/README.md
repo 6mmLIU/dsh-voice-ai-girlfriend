@@ -19,27 +19,23 @@
    直播伴侣 / OBS 采集这个窗口和它的声音
 ```
 
-## 快速开始（Mac）
+## 快速开始（Windows / Linux / macOS）
 
-先起本地耳语声线服务（第一次会装依赖、下载约 5GB 模型），再起舞台：
+需要：Python 3.12、[ffmpeg](https://ffmpeg.org/download.html)（macOS `brew install ffmpeg`，Windows `winget install Gyan.FFmpeg`，Ubuntu `sudo apt install ffmpeg`）。依次启动三个服务，每个脚本第一次运行时会自动建虚拟环境、装依赖：
 
-```bash
-uv venv venv-tts --python 3.12 && uv pip install --python venv-tts/bin/python mlx-audio fastapi uvicorn soundfile
-```
+| 服务 | macOS / Linux | Windows |
+|---|---|---|
+| 1. 耳语声线（第一次下载约 5GB 模型） | `./asmr/start-tts.sh` | 双击 `asmr\start-tts.cmd` |
+| 2. 舞台 | `./asmr/start-asmr.sh` | 双击 `asmr\start-asmr.cmd` |
+| 3. 视频号评论（可选，见「五」） | `./asmr/start-channels.sh` | 双击 `asmr\start-channels.cmd` |
 
-```bash
-venv-tts/bin/python -m asmr.tts_server --voice whisper
-```
+声线服务按电脑自动选引擎：Apple 芯片的 Mac 用 MLX；Windows / Linux 用 PyTorch，有 NVIDIA 显卡时走 GPU（要先装 CUDA 版 PyTorch，见 `asmr/requirements-tts-torch.txt`），没有显卡时走 CPU，可以加 `--small` 用 0.6B 模型提速。
 
-```bash
-./asmr/start-asmr.sh
-```
-
-- 舞台：<http://127.0.0.1:8770/>，点一下解锁声音。加 `?debug=1` 显示状态，`?caption=0` 隐藏字幕，`?lights=0` 关掉灯光叠加，`?palette=lavender` / `blue` / `warm` 换灯光色调（默认淡紫）。
-- 中控台：<http://127.0.0.1:8770/control>，可以发模拟弹幕、一键插播敲击/毛毡/灯光，也可以手写脚本插播。
+- 舞台：<http://127.0.0.1:8770/>，点一下解锁声音。加 `?debug=1` 显示状态，`?caption=0` 隐藏字幕，`?lights=0` 关掉灯光，`?palette=lavender` / `blue` / `warm` 换灯光色调（默认淡紫）。
+- 中控台：<http://127.0.0.1:8770/control>，现场控制动作、插话、换装、模拟弹幕。
 - 戴耳机听。
 
-声线服务没起来时会自动退回 macOS 自带语音；没有任何素材时，会用程序画的占位画面。
+声线服务没起来时，Mac 会退回系统自带语音；没有任何素材时，会用程序画的占位画面。
 
 配置：把 `asmr/asmr-config.example.json` 复制为 `asmr/asmr-config.json` 再改（这个文件不会被提交）。接 LLM 需要设置 `DEEPSEEK_API_KEY` 环境变量，或者填 `llm.api_key`；不填时用内置的备用台词。
 
@@ -142,6 +138,30 @@ python api_v2.py -a 0.0.0.0 -p 9880
 - 音频是 48kHz 立体声，推流码率建议设到 192k 以上，否则双耳效果和细节会被压掉。
 - 真实弹幕：写一个抓取脚本，把每条弹幕 `POST /api/danmaku {"user": "...", "text": "..."}` 发给舞台服务就行。中控台的模拟弹幕走的也是同一个接口。
 
+## 五、接入直播间评论（视频号）
+
+视频号没有公开的直播评论接口。这里用业内通用的「浏览器模式」：程序用 Playwright 打开一个独立的 Chromium 窗口进入视频号助手，监听页面收到的数据（接口响应和 WebSocket 消息），把评论、礼物、进场、关注挑出来转发给舞台。三个系统都能用。
+
+1. 启动舞台，再运行 `start-channels`。
+2. 第一次会弹出视频号助手的登录页，用微信扫码。登录状态保存在 `asmr/out/channels-profile/`，下次不用再扫。
+3. 在这个窗口里打开「直播」开播。评论会自动进入舞台：她会边做动作边耳语回复。
+
+| 事件 | 怎么处理 |
+|---|---|
+| 评论 | 去重、屏蔽词、同一观众 20 秒内只回一次，然后交给导演（LLM）写耳语回复 |
+| 送礼 | 立即插播感谢台词（不等 LLM）；同一人连送同一礼物会合并成一次 |
+| 关注 | 感谢台词，限频 |
+| 进场 | 不忙时偶尔欢迎一句，最多 45 秒一次 |
+| 点赞 | 攒够了、空闲时说一句谢谢 |
+
+规则和台词都在 `asmr-config.json` 的 `"interaction"` 里改（默认值见 `asmr/interaction.py`）。
+
+- `--dump`：把页面收到的原始数据存到 `asmr/out/channels-dump/`。视频号改版导致评论读不到时，用它看看新的数据格式。
+- `--dom`：额外从页面元素读取新出现的评论，作为兜底。
+- 没开播也能演练：`venv-asmr/bin/python -m asmr.danmaku.mock` 会模拟一个热闹的直播间（评论、送礼、进场、点赞）。
+- 其他平台：任何程序只要把事件 `POST /api/event {"kind","user","text","gift","count","id","platform"}` 发给舞台就能接入。
+- Linux 服务器没有桌面时，用虚拟显示运行：`xvfb-run ./asmr/start-channels.sh`。
+
 ## 脚本标签
 
 | 标签 | 作用 |
@@ -230,10 +250,14 @@ venv-asmr/bin/python -m asmr.tools.stabilize_clips --outfit 1-lavender-knit
 | `media.py` | 视频素材库，读取素材自带的声音 |
 | `sounds.py` | 触发音（录音或程序生成的占位） |
 | `tts.py` | 可插拔的 TTS |
-| `tts_server.py` | Mac 本地耳语声线服务（Qwen3-TTS MLX） |
+| `tts_server.py` | 本地耳语声线服务（Qwen3-TTS） |
 | `voices/` | 设计好的声线（参考音频和文本） |
 | `tools/design_voice.py` | 用文字描述设计声线 |
 | `performer.py` | 实时排播：一段一段播，支持停止、切换、改时长 |
+| `interaction.py` | 直播间事件（评论、礼物、进场、关注、点赞）的处理规则 |
+| `danmaku/wechat_channels.py` | 视频号评论采集（Playwright） |
+| `danmaku/mock.py` | 模拟直播间，用来演练 |
+| `tts_engines.py` | 声线引擎：MLX（Apple 芯片）/ PyTorch（Windows、Linux） |
 | `tools/stabilize_clips.py` | 去掉镜头漂移，让所有接缝像素级一致 |
 | `stage/` | 舞台页面和中控台 |
 | `tools/prepare_clips.py` | 素材整理工具 |

@@ -1,0 +1,8 @@
+# Whisper-voice TTS server on Windows / Linux (Python 3.12 venv: venv-tts).
+# With an NVIDIA GPU, install the CUDA build of PyTorch first, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# (pick the CUDA version for your driver at https://pytorch.org/get-started/locally/)
+qwen-tts
+fastapi
+uvicorn
+soundfile

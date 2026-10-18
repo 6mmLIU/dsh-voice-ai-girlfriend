@@ -1,0 +1,5 @@
+# Whisper-voice TTS server on Apple Silicon Macs (Python 3.12 venv: venv-tts)
+mlx-audio
+fastapi
+uvicorn
+soundfile
