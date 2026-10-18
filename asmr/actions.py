@@ -59,14 +59,14 @@ CATALOG: list[Action] = [
     Action("velvet", "丝绒", "柔软", 18, "sweep", "丝绒布在麦克风上缓慢摩擦", "soft"),
     Action("felt", "毛毡", "柔软", 18, "sweep", "双手搓毛毡垫"),
     # ⑤ 纸张、包装袋、气泡膜
-    Action("page", "翻书", "纸张", 18, "center", "缓慢翻书页"),
-    Action("paper", "揉纸", "纸张", 14, "sweep", "慢慢揉捏包装纸"),
-    Action("bubble", "气泡膜", "纸张", 12, "alternate", "一颗一颗按压气泡膜"),
-    Action("tape", "胶带", "纸张", 10, "sweep", "慢慢撕开胶带"),
+    Action("page", "翻书", "纸张", 18, "center", "缓慢翻书页", "paper"),
+    Action("paper", "揉纸", "纸张", 14, "sweep", "慢慢揉捏包装纸", "paper"),
+    Action("bubble", "气泡膜", "纸张", 12, "alternate", "一颗一颗按压气泡膜", "paper"),
+    Action("tape", "胶带", "纸张", 10, "sweep", "慢慢撕开胶带", "paper"),
     # ⑥ 手套、护手霜、手部动作
-    Action("gloves", "手套", "手部", 18, "alternate", "戴着乳胶手套搓手、指尖摩擦"),
-    Action("hands", "搓手", "手部", 14, "center", "双手缓慢搓手，在镜头前轻柔移动"),
-    Action("lotion", "护手霜", "手部", 16, "center", "挤护手霜，双手慢慢揉开"),
+    Action("gloves", "手套", "手部", 18, "alternate", "戴着乳胶手套搓手、指尖摩擦", "gloves"),
+    Action("hands", "搓手", "手部", 14, "center", "双手缓慢搓手，在镜头前轻柔移动", "lotion"),
+    Action("lotion", "护手霜", "手部", 16, "center", "挤护手霜，双手慢慢揉开", "lotion"),
     # 其他
     Action("breath", "呼吸", "其他", 6, "center", "一次缓慢的呼吸"),
 ]
